@@ -7,7 +7,7 @@ const identifier = {
 };
 
 const hasIdentifier = (value, helpers) => {
-  if (!value.ticketKey && !value.verificationToken) {
+  if (!value.ticketKey && !value.verificationToken && !value.token) {
     return helpers.error('any.custom', { message: 'Provide a ticket key or a scanned QR token' });
   }
   return value;
