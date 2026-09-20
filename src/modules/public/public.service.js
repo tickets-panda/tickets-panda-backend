@@ -2,6 +2,8 @@ import prisma from '../../lib/prisma.js';
 import { NotFoundError } from '../../utils/errors.js';
 import { resolveVerificationToken } from '../customers/customer.service.js';
 
+export { resolveVerificationToken };
+
 const tenantIsPublic = (tenant) => tenant && tenant.status === 'ACTIVE';
 
 const remainingFor = (ticketType) => Math.max(0, ticketType.quantity - ticketType.soldCount);
