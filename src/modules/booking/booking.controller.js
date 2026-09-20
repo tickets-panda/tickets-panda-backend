@@ -7,18 +7,54 @@ export const initiate = async (req, res) => {
 };
 
 export const verifyPayment = async (req, res) => {
-  const { order, tickets, alreadyProcessed } = await bookingService.verifyPayment(req.body, req);
+  const result = await bookingService.verifyPayment(req.body, req);
+
+  if (result.status === 'FAILED') {
+    return res.status(400).json({
+      success: false,
+      message: result.message || 'Payment simulation failed',
+      data: {
+        orderRef: result.order.orderRef,
+        status: 'FAILED',
+        canRetry: true,
+      },
+    });
+  }
+
+  if (result.status === 'PENDING') {
+    return success(
+      res,
+      {
+        orderRef: result.order.orderRef,
+        status: 'PENDING',
+        message: result.message,
+      },
+      'Payment is pending',
+    );
+  }
+
   return success(
     res,
     {
-      orderRef: order.orderRef,
-      amount: Number(order.amount),
-      currency: order.currency,
-      tickets,
-      alreadyProcessed,
+      orderRef: result.order.orderRef,
+      amount: Number(result.order.amount),
+      currency: result.order.currency,
+      status: 'PAID',
+      tickets: result.tickets,
+      alreadyProcessed: result.alreadyProcessed,
     },
-    alreadyProcessed ? 'This payment was already verified' : 'Payment verified — your tickets are ready',
+    result.alreadyProcessed ? 'This payment was already verified' : 'Payment verified — your tickets are ready',
   );
+};
+
+export const checkoutDetails = async (req, res) => {
+  const data = await bookingService.getCheckoutDetails(req.params.orderRef);
+  return success(res, data);
+};
+
+export const retryPayment = async (req, res) => {
+  const data = await bookingService.retryOrder(req.body.orderRef, req);
+  return success(res, data, 'Order payment reset for retry');
 };
 
 export const confirmation = async (req, res) => {
@@ -33,4 +69,4 @@ export const downloadPdf = async (req, res) => {
   return res.send(pdfBuffer);
 };
 
-export default { initiate, verifyPayment, confirmation, downloadPdf };
+export default { initiate, verifyPayment, checkoutDetails, retryPayment, confirmation, downloadPdf };

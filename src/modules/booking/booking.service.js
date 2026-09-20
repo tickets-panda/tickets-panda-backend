@@ -18,6 +18,7 @@ import { normaliseEmail, normalisePhone } from '../../utils/helpers.js';
 import { generateOrderRef, generateRegistrationRef } from '../../utils/generators.js';
 import { verifyRazorpaySignature } from '../../utils/verifySignature.js';
 import { getRazorpay, isRazorpayConfigured } from '../../config/razorpay.js';
+import * as paymentService from '../payments/payment.service.js';
 import { generateTicketsForOrder, serialiseTicket } from '../tickets/ticket.service.js';
 import { generateTicketPdf } from '../tickets/ticketPdf.service.js';
 import { sendTemplateEmail } from '../notifications/notifications.service.js';
@@ -58,8 +59,8 @@ export async function initiateBooking(payload, req) {
   const { eventId, activityId, ticketTypeId, quantity, customer } = payload;
   const formData = payload.formData || {};
 
-  // Fail before we hold any inventory if the gateway is not configured.
-  if (!isRazorpayConfigured()) {
+  const provider = paymentService.getPaymentProvider();
+  if (provider.name === 'razorpay' && !isRazorpayConfigured()) {
     throw new AppError('Online payments are not configured yet. Please contact the organizer.', 503);
   }
 
@@ -152,22 +153,24 @@ export async function initiateBooking(payload, req) {
     return { registration, order, customerRecord };
   });
 
-  let razorpayOrder;
+  let providerResult;
   try {
-    razorpayOrder = await getRazorpay().orders.create({
-      amount: Math.round(amount * 100), // paise
+    providerResult = await paymentService.createPaymentOrder({
+      order,
+      registration,
+      amount,
       currency,
-      receipt: order.orderRef,
+      customer: customerRecord,
       notes: { eventId: String(event.id), registrationRef: registration.registrationRef },
     });
   } catch (err) {
-    logger.error(`Razorpay order creation failed: ${err.message}`);
+    logger.error(`Payment provider order creation failed: ${err.message}`);
     await sequelize.transaction(async (t) => {
       await order.update({ status: 'FAILED' }, { transaction: t });
       await registration.update({ status: 'CANCELLED' }, { transaction: t });
       await TicketType.decrement('soldCount', { by: quantity, where: { id: ticketType.id }, transaction: t });
     });
-    throw new AppError('Could not start the payment. Please try again.', 502);
+    throw new AppError(`Could not start the payment: ${err.message}`, 502);
   }
 
   await sequelize.transaction(async (t) => {
@@ -176,7 +179,9 @@ export async function initiateBooking(payload, req) {
       {
         orderId: order.id,
         tenantId: event.tenantId,
-        razorpayOrderId: razorpayOrder.id,
+        provider: providerResult.provider,
+        providerOrderId: providerResult.providerOrderId,
+        razorpayOrderId: providerResult.provider === 'razorpay' ? providerResult.providerOrderId : null,
         amount,
         currency,
         status: 'CREATED',
@@ -190,7 +195,7 @@ export async function initiateBooking(payload, req) {
     action: AUDIT_ACTIONS.BOOKING_INITIATED,
     entityType: 'order',
     entityId: order.id,
-    details: { orderRef: order.orderRef, eventId: event.id, quantity, amount },
+    details: { orderRef: order.orderRef, eventId: event.id, quantity, amount, provider: providerResult.provider },
     req,
   });
 
@@ -198,8 +203,11 @@ export async function initiateBooking(payload, req) {
     orderId: order.id,
     orderRef: order.orderRef,
     registrationRef: registration.registrationRef,
-    razorpayOrderId: razorpayOrder.id,
-    razorpayKeyId: env.razorpay.keyId,
+    paymentProvider: providerResult.provider,
+    providerOrderId: providerResult.providerOrderId,
+    checkoutUrl: providerResult.provider === 'local' ? `/checkout/local/${order.orderRef}` : null,
+    razorpayOrderId: providerResult.providerOrderId,
+    razorpayKeyId: env.razorpay.keyId || null,
     amount,
     currency,
     quantity,
@@ -213,8 +221,25 @@ export async function initiateBooking(payload, req) {
  * 2. Verify payment (never trust the frontend callback alone)
  * ------------------------------------------------------------------ */
 
-export async function verifyPayment({ orderId, razorpayOrderId, razorpayPaymentId, razorpaySignature }, req) {
-  const order = await Order.findByPk(orderId, {
+export async function verifyPayment(payload, req) {
+  const {
+    orderId,
+    orderRef,
+    simulationState = 'SUCCESS',
+    method = 'TEST_LOCAL',
+    failureReason,
+    razorpayOrderId,
+    razorpayPaymentId,
+    razorpaySignature,
+  } = payload;
+
+  const whereClause = {};
+  if (orderId) whereClause.id = orderId;
+  else if (orderRef) whereClause.orderRef = orderRef;
+  else throw new ValidationError('orderId or orderRef is required');
+
+  const order = await Order.findOne({
+    where: whereClause,
     include: [
       { model: Registration, as: 'registration' },
       { model: Payment, as: 'payment' },
@@ -223,10 +248,19 @@ export async function verifyPayment({ orderId, razorpayOrderId, razorpayPaymentI
   });
   if (!order) throw new NotFoundError('Order not found');
 
-  // Idempotency — replaying a webhook/retry returns the existing tickets.
+  // Idempotency — replaying on an already paid order returns the existing tickets.
   if (order.status === 'PAID') {
     const existing = await Ticket.findAll({ where: { orderId: order.id } });
-    return { order, tickets: existing.map(serialiseTicket), alreadyProcessed: true };
+    return {
+      order,
+      status: 'PAID',
+      tickets: existing.map(serialiseTicket),
+      alreadyProcessed: true,
+    };
+  }
+
+  if (order.status === 'FAILED') {
+    throw new ConflictError('This order has failed. Please retry payment to proceed.');
   }
 
   if (!['CREATED', 'PAYMENT_PENDING'].includes(order.status)) {
@@ -235,62 +269,156 @@ export async function verifyPayment({ orderId, razorpayOrderId, razorpayPaymentI
 
   const payment = order.payment;
   if (!payment) throw new NotFoundError('Payment record not found for this order');
-  if (payment.razorpayOrderId && payment.razorpayOrderId !== razorpayOrderId) {
-    throw new ValidationError('This payment does not belong to the given order');
-  }
 
-  if (!isRazorpayConfigured()) throw new AppError('Online payments are not configured yet.', 503);
+  const providerName = payment.provider || 'local';
 
-  // Step 1 — cryptographic signature verification.
-  const signatureValid = verifyRazorpaySignature(
-    razorpayOrderId,
-    razorpayPaymentId,
-    razorpaySignature,
-    env.razorpay.keySecret,
-  );
-
-  if (!signatureValid) {
-    await sequelize.transaction(async (t) => {
-      await payment.update({ status: 'FAILED', failedReason: 'Signature verification failed' }, { transaction: t });
-      await order.update({ status: 'FAILED' }, { transaction: t });
+  // 1. LOCAL TEST PAYMENT PROVIDER
+  if (providerName === 'local') {
+    const verification = await paymentService.verifyPaymentWithProvider({
+      providerOrderId: payment.providerOrderId,
+      providerPaymentId: razorpayPaymentId || payload.providerPaymentId,
+      simulationState,
+      method,
+      failureReason,
     });
-    await recordAudit({
-      tenantId: order.tenantId,
-      action: AUDIT_ACTIONS.PAYMENT_FAILED,
-      entityType: 'payment',
-      entityId: payment.id,
-      details: { orderRef: order.orderRef, reason: 'signature_mismatch' },
+
+    if (verification.status === 'FAILED') {
+      await sequelize.transaction(async (t) => {
+        await payment.update(
+          {
+            status: 'FAILED',
+            providerPaymentId: verification.providerPaymentId,
+            failedReason: verification.failedReason,
+          },
+          { transaction: t },
+        );
+        await order.update({ status: 'FAILED' }, { transaction: t });
+
+        // Release inventory held by this order
+        const registration = order.registration || (await Registration.findByPk(order.registrationId, { transaction: t }));
+        if (registration) {
+          await registration.update({ status: 'CANCELLED' }, { transaction: t });
+          await TicketType.decrement('soldCount', {
+            by: registration.quantity,
+            where: { id: registration.ticketTypeId },
+            transaction: t,
+          });
+        }
+      });
+
+      await recordAudit({
+        tenantId: order.tenantId,
+        action: AUDIT_ACTIONS.PAYMENT_FAILED,
+        entityType: 'payment',
+        entityId: payment.id,
+        details: { orderRef: order.orderRef, reason: verification.failedReason },
+        req,
+      });
+
+      return {
+        order,
+        status: 'FAILED',
+        message: verification.failedReason,
+        canRetry: true,
+        alreadyProcessed: false,
+      };
+    }
+
+    if (verification.status === 'PENDING') {
+      await payment.update({
+        status: 'PENDING',
+        providerPaymentId: verification.providerPaymentId,
+      });
+      return {
+        order,
+        status: 'PENDING',
+        message: verification.message || 'Payment is currently pending confirmation',
+        alreadyProcessed: false,
+      };
+    }
+
+    // SUCCESS / CAPTURED
+    const tickets = await finalisePaidOrder({
+      order,
+      payment,
+      providerPaymentId: verification.providerPaymentId,
+      providerSignature: 'simulated_local_signature',
+      method: verification.method || 'TEST_LOCAL',
       req,
+      source: 'checkout_local',
     });
-    throw new ValidationError('Payment signature verification failed');
+
+    return {
+      order,
+      status: 'PAID',
+      tickets: tickets.map(serialiseTicket),
+      alreadyProcessed: false,
+    };
   }
 
-  // Step 2 — confirm with Razorpay that the payment is actually captured.
-  let remote;
-  try {
-    remote = await getRazorpay().payments.fetch(razorpayPaymentId);
-  } catch (err) {
-    logger.error(`Razorpay payment fetch failed: ${err.message}`);
-    throw new AppError('Could not confirm the payment with the gateway. Please retry.', 502);
+  // 2. RAZORPAY PAYMENT PROVIDER
+  if (providerName === 'razorpay') {
+    if (payment.razorpayOrderId && payment.razorpayOrderId !== razorpayOrderId) {
+      throw new ValidationError('This payment does not belong to the given order');
+    }
+    if (!isRazorpayConfigured()) throw new AppError('Online payments are not configured yet.', 503);
+
+    // Cryptographic signature verification
+    const signatureValid = verifyRazorpaySignature(
+      razorpayOrderId,
+      razorpayPaymentId,
+      razorpaySignature,
+      env.razorpay.keySecret,
+    );
+
+    if (!signatureValid) {
+      await sequelize.transaction(async (t) => {
+        await payment.update({ status: 'FAILED', failedReason: 'Signature verification failed' }, { transaction: t });
+        await order.update({ status: 'FAILED' }, { transaction: t });
+      });
+      await recordAudit({
+        tenantId: order.tenantId,
+        action: AUDIT_ACTIONS.PAYMENT_FAILED,
+        entityType: 'payment',
+        entityId: payment.id,
+        details: { orderRef: order.orderRef, reason: 'signature_mismatch' },
+        req,
+      });
+      throw new ValidationError('Payment signature verification failed');
+    }
+
+    let remote;
+    try {
+      remote = await getRazorpay().payments.fetch(razorpayPaymentId);
+    } catch (err) {
+      logger.error(`Razorpay payment fetch failed: ${err.message}`);
+      throw new AppError('Could not confirm the payment with the gateway. Please retry.', 502);
+    }
+
+    if (remote.order_id !== razorpayOrderId) throw new ValidationError('Payment does not belong to this order');
+    if (!['captured', 'authorized'].includes(remote.status)) {
+      throw new ConflictError(`Payment is not captured (gateway status: ${remote.status})`);
+    }
+
+    const tickets = await finalisePaidOrder({
+      order,
+      payment,
+      providerPaymentId: razorpayPaymentId,
+      providerSignature: razorpaySignature,
+      method: remote.method || null,
+      req,
+      source: 'checkout_razorpay',
+    });
+
+    return {
+      order,
+      status: 'PAID',
+      tickets: tickets.map(serialiseTicket),
+      alreadyProcessed: false,
+    };
   }
 
-  if (remote.order_id !== razorpayOrderId) throw new ValidationError('Payment does not belong to this order');
-  if (!['captured', 'authorized'].includes(remote.status)) {
-    throw new ConflictError(`Payment is not captured (gateway status: ${remote.status})`);
-  }
-
-  // Step 3 — mark paid, generate tickets, notify.
-  const tickets = await finalisePaidOrder({
-    order,
-    payment,
-    razorpayPaymentId,
-    razorpaySignature,
-    method: remote.method || null,
-    req,
-    source: 'checkout',
-  });
-
-  return { order, tickets: tickets.map(serialiseTicket), alreadyProcessed: false };
+  throw new AppError(`Unknown payment provider: ${providerName}`, 500);
 }
 
 /**
@@ -301,8 +429,8 @@ export async function verifyPayment({ orderId, razorpayOrderId, razorpayPaymentI
 export async function finalisePaidOrder({
   order,
   payment,
-  razorpayPaymentId,
-  razorpaySignature = null,
+  providerPaymentId,
+  providerSignature = null,
   method = null,
   req = null,
   source = 'webhook',
@@ -314,12 +442,15 @@ export async function finalisePaidOrder({
   const registration = order.registration || (await Registration.findByPk(order.registrationId));
 
   const tickets = await sequelize.transaction(async (t) => {
+    const isRazorpay = payment.provider === 'razorpay';
     await payment.update(
       {
-        razorpayPaymentId,
-        razorpaySignature,
+        providerPaymentId: providerPaymentId || payment.providerPaymentId,
+        providerSignature: providerSignature || payment.providerSignature,
+        razorpayPaymentId: isRazorpay ? providerPaymentId : payment.razorpayPaymentId,
+        razorpaySignature: isRazorpay ? providerSignature : payment.razorpaySignature,
         status: 'CAPTURED',
-        method: method || payment.method || null,
+        method: method || payment.method || 'TEST_LOCAL',
         capturedAt: new Date(),
       },
       { transaction: t },
@@ -331,20 +462,21 @@ export async function finalisePaidOrder({
   });
 
   const customer = order.customer || (await Customer.findByPk(order.customerId));
-  const [event, ticketType, tenant] = await Promise.all([
+  const [event, activity, ticketType, tenant] = await Promise.all([
     Event.findByPk(registration.eventId),
+    registration.activityId ? Activity.findByPk(registration.activityId) : null,
     TicketType.findByPk(registration.ticketTypeId),
     Tenant.findByPk(order.tenantId),
   ]);
 
-  await deliverTickets({ order, registration, customer, event, ticketType, tenant, tickets });
+  await deliverTickets({ order, registration, customer, event, activity, ticketType, tenant, tickets });
 
   await recordAudit({
     tenantId: order.tenantId,
     action: AUDIT_ACTIONS.TICKETS_GENERATED,
     entityType: 'order',
     entityId: order.id,
-    details: { orderRef: order.orderRef, ticketCount: tickets.length, paymentId: razorpayPaymentId, source },
+    details: { orderRef: order.orderRef, ticketCount: tickets.length, paymentId: providerPaymentId, source },
     req,
   });
 
@@ -352,10 +484,10 @@ export async function finalisePaidOrder({
 }
 
 /** Emails the tickets to the customer and a notification to the tenant. */
-async function deliverTickets({ order, registration, customer, event, ticketType, tenant, tickets }) {
+async function deliverTickets({ order, registration, customer, event, activity, ticketType, tenant, tickets }) {
   let pdfBuffer = null;
   try {
-    pdfBuffer = await generateTicketPdf({ event, customer, tickets, orderRef: order.orderRef });
+    pdfBuffer = await generateTicketPdf({ event, activity, customer, tickets, orderRef: order.orderRef });
   } catch (err) {
     logger.error(`PDF generation failed for ${order.orderRef}: ${err.message}`);
   }
@@ -374,6 +506,7 @@ async function deliverTickets({ order, registration, customer, event, ticketType
     data: {
       customerName: customer.name,
       event,
+      activityTitle: activity?.title || null,
       orderRef: order.orderRef,
       amount: order.amount,
       currency: order.currency,
@@ -391,6 +524,7 @@ async function deliverTickets({ order, registration, customer, event, ticketType
       data: {
         tenantName: tenant.name,
         event,
+        activityTitle: activity?.title || null,
         orderRef: order.orderRef,
         customer: { name: customer.name, email: customer.email },
         quantity: registration.quantity,
@@ -403,7 +537,180 @@ async function deliverTickets({ order, registration, customer, event, ticketType
 }
 
 /* ------------------------------------------------------------------ *
- * 3. Confirmation (public, keyed by order reference)
+ * 3. Checkout Details & Retry
+ * ------------------------------------------------------------------ */
+
+export async function getCheckoutDetails(orderRef) {
+  const order = await Order.findOne({
+    where: { orderRef },
+    include: [
+      { model: Customer, as: 'customer', attributes: ['id', 'name', 'email', 'phone'] },
+      { model: Payment, as: 'payment' },
+      {
+        model: Registration,
+        as: 'registration',
+        include: [
+          {
+            model: Event,
+            as: 'event',
+            attributes: ['id', 'title', 'slug', 'bannerUrl', 'eventDate', 'eventTimeStart', 'venueName', 'venueAddress'],
+          },
+          {
+            model: Activity,
+            as: 'activity',
+            attributes: ['id', 'title', 'slug', 'venue', 'startsAt'],
+          },
+          {
+            model: TicketType,
+            as: 'ticketType',
+            attributes: ['id', 'name', 'price', 'currency'],
+          },
+        ],
+      },
+    ],
+  });
+
+  if (!order) throw new NotFoundError('Order not found');
+
+  return {
+    orderRef: order.orderRef,
+    orderId: order.id,
+    status: order.status,
+    amount: Number(order.amount),
+    currency: order.currency,
+    quantity: order.registration?.quantity || 1,
+    paymentProvider: order.payment?.provider || (env.payments.isLocal ? 'local' : 'razorpay'),
+    providerOrderId: order.payment?.providerOrderId || order.payment?.razorpayOrderId,
+    customer: order.customer,
+    event: order.registration?.event,
+    activity: order.registration?.activity,
+    ticketType: order.registration?.ticketType,
+    payment: order.payment ? {
+      id: order.payment.id,
+      provider: order.payment.provider,
+      providerOrderId: order.payment.providerOrderId,
+      status: order.payment.status,
+      method: order.payment.method,
+      failedReason: order.payment.failedReason,
+    } : null,
+    createdAt: order.createdAt,
+  };
+}
+
+export async function retryOrder(orderRef, req) {
+  const order = await Order.findOne({
+    where: { orderRef },
+    include: [
+      { model: Customer, as: 'customer' },
+      { model: Payment, as: 'payment' },
+      { model: Registration, as: 'registration' },
+    ],
+  });
+
+  if (!order) throw new NotFoundError('Order not found');
+  if (order.status === 'PAID') {
+    throw new ConflictError('This order is already paid');
+  }
+
+  // If already pending or created, just return current checkout info
+  if (['CREATED', 'PAYMENT_PENDING'].includes(order.status)) {
+    return getCheckoutDetails(orderRef);
+  }
+
+  if (order.status !== 'FAILED') {
+    throw new ConflictError(`Cannot retry order with status: ${order.status}`);
+  }
+
+  const registration = order.registration;
+  if (!registration) throw new NotFoundError('Registration record not found for this order');
+
+  const event = await Event.findByPk(registration.eventId);
+  if (!event) throw new NotFoundError('Event not found');
+  if (event.status !== 'LIVE') throw new ConflictError('This event is no longer open for registration');
+  if (event.registrationDeadline && new Date(event.registrationDeadline) < new Date()) {
+    throw new ConflictError('Registration deadline has passed');
+  }
+
+  const customer = order.customer;
+  const quantity = registration.quantity;
+
+  // Re-check inventory and re-reserve tickets
+  await sequelize.transaction(async (t) => {
+    const locked = await TicketType.findByPk(registration.ticketTypeId, { lock: t.LOCK.UPDATE, transaction: t });
+    if (!locked || !locked.isActive) {
+      throw new ConflictError('The ticket type is no longer available');
+    }
+    if (locked.soldCount + quantity > locked.quantity) {
+      throw new ConflictError('Not enough tickets remaining to retry this order');
+    }
+    if (event.maxCapacity) {
+      const held = await TicketType.findOne({
+        where: { eventId: event.id },
+        attributes: [[fn('COALESCE', fn('SUM', col('sold_count')), 0), 'held']],
+        raw: true,
+        transaction: t,
+      });
+      if (Number(held?.held || 0) + quantity > event.maxCapacity) {
+        throw new ConflictError('This event has reached its maximum capacity');
+      }
+    }
+
+    await locked.increment('soldCount', { by: quantity, transaction: t });
+    await registration.update({ status: 'PAYMENT_PENDING' }, { transaction: t });
+    await order.update({ status: 'PAYMENT_PENDING' }, { transaction: t });
+
+    const providerResult = await paymentService.createPaymentOrder({
+      order,
+      registration,
+      amount: Number(order.amount),
+      currency: order.currency,
+      customer,
+      notes: { eventId: String(event.id), registrationRef: registration.registrationRef, retry: true },
+    });
+
+    if (order.payment) {
+      await order.payment.update(
+        {
+          provider: providerResult.provider,
+          providerOrderId: providerResult.providerOrderId,
+          razorpayOrderId: providerResult.provider === 'razorpay' ? providerResult.providerOrderId : null,
+          status: 'CREATED',
+          failedReason: null,
+          method: null,
+        },
+        { transaction: t },
+      );
+    } else {
+      await Payment.create(
+        {
+          orderId: order.id,
+          tenantId: order.tenantId,
+          provider: providerResult.provider,
+          providerOrderId: providerResult.providerOrderId,
+          razorpayOrderId: providerResult.provider === 'razorpay' ? providerResult.providerOrderId : null,
+          amount: order.amount,
+          currency: order.currency,
+          status: 'CREATED',
+        },
+        { transaction: t },
+      );
+    }
+  });
+
+  await recordAudit({
+    tenantId: order.tenantId,
+    action: AUDIT_ACTIONS.BOOKING_INITIATED,
+    entityType: 'order',
+    entityId: order.id,
+    details: { orderRef: order.orderRef, retry: true },
+    req,
+  });
+
+  return getCheckoutDetails(orderRef);
+}
+
+/* ------------------------------------------------------------------ *
+ * 4. Confirmation (public, keyed by order reference)
  * ------------------------------------------------------------------ */
 
 export async function getConfirmation(orderRef) {
@@ -411,13 +718,14 @@ export async function getConfirmation(orderRef) {
     where: { orderRef },
     include: [
       { model: Customer, as: 'customer', attributes: ['id', 'name', 'email'] },
-      { model: Payment, as: 'payment', attributes: ['id', 'status', 'method'] },
+      { model: Payment, as: 'payment', attributes: ['id', 'status', 'method', 'provider'] },
       { model: Ticket, as: 'tickets' },
       {
         model: Registration,
         as: 'registration',
         include: [
           { model: Event, as: 'event', attributes: ['id', 'title', 'slug', 'eventDate', 'eventTimeStart', 'venueName', 'venueAddress', 'bannerUrl'] },
+          { model: Activity, as: 'activity', attributes: ['id', 'title', 'slug', 'venue', 'startsAt'] },
           { model: TicketType, as: 'ticketType', attributes: ['id', 'name', 'price'] },
         ],
       },
@@ -434,6 +742,7 @@ export async function getConfirmation(orderRef) {
     customer: order.customer,
     payment: order.payment,
     event: order.registration?.event,
+    activity: order.registration?.activity,
     ticketType: order.registration?.ticketType,
     quantity: order.registration?.quantity,
     tickets: (order.tickets || []).map(serialiseTicket),
@@ -471,4 +780,12 @@ export async function getOrderPdfBuffer(orderRef) {
   return { pdfBuffer, filename: `ticket-${order.orderRef}.pdf` };
 }
 
-export default { initiateBooking, verifyPayment, finalisePaidOrder, getConfirmation, getOrderPdfBuffer };
+export default {
+  initiateBooking,
+  verifyPayment,
+  finalisePaidOrder,
+  getCheckoutDetails,
+  retryOrder,
+  getConfirmation,
+  getOrderPdfBuffer,
+};

@@ -9,7 +9,11 @@ Payment.init(
     id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
     orderId: { type: DataTypes.INTEGER, allowNull: false },
     tenantId: { type: DataTypes.INTEGER, allowNull: false },
-    razorpayOrderId: { type: DataTypes.STRING(100), allowNull: false },
+    provider: { type: DataTypes.STRING(50), defaultValue: 'local' },
+    providerOrderId: { type: DataTypes.STRING(100), allowNull: true },
+    providerPaymentId: { type: DataTypes.STRING(100), allowNull: true },
+    providerSignature: { type: DataTypes.STRING(255), allowNull: true },
+    razorpayOrderId: { type: DataTypes.STRING(100), allowNull: true },
     razorpayPaymentId: { type: DataTypes.STRING(100), allowNull: true },
     razorpaySignature: { type: DataTypes.STRING(255), allowNull: true },
     amount: { type: DataTypes.DECIMAL(10, 2), allowNull: false },
@@ -23,7 +27,12 @@ Payment.init(
     sequelize,
     modelName: 'Payment',
     tableName: 'payments',
-    indexes: [{ fields: ['order_id'] }, { fields: ['razorpay_payment_id'] }],
+    indexes: [
+      { fields: ['order_id'] },
+      { fields: ['provider_order_id'] },
+      { fields: ['provider_payment_id'] },
+      { fields: ['razorpay_payment_id'] },
+    ],
   },
 );
 

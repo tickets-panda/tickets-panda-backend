@@ -45,6 +45,13 @@ export const env = {
     customerExpiry: str('JWT_CUSTOMER_EXPIRY', '30m'),
   },
 
+  payments: {
+    provider: str('PAYMENT_PROVIDER', 'local').toLowerCase(),
+    get isLocal() {
+      return this.provider === 'local';
+    },
+  },
+
   razorpay: {
     keyId: str('RAZORPAY_KEY_ID'),
     keySecret: str('RAZORPAY_KEY_SECRET'),

@@ -14,10 +14,18 @@ export const initiateBookingSchema = Joi.object({
 });
 
 export const verifyPaymentSchema = Joi.object({
-  orderId: Joi.number().integer().positive().required(),
-  razorpayOrderId: Joi.string().trim().required(),
-  razorpayPaymentId: Joi.string().trim().required(),
-  razorpaySignature: Joi.string().trim().required(),
+  orderId: Joi.number().integer().positive().allow(null),
+  orderRef: Joi.string().trim().allow('', null),
+  simulationState: Joi.string().valid('SUCCESS', 'FAILED', 'PENDING').default('SUCCESS'),
+  method: Joi.string().trim().max(50).allow('', null),
+  failureReason: Joi.string().trim().max(255).allow('', null),
+  razorpayOrderId: Joi.string().trim().allow('', null),
+  razorpayPaymentId: Joi.string().trim().allow('', null),
+  razorpaySignature: Joi.string().trim().allow('', null),
+}).or('orderId', 'orderRef');
+
+export const retryPaymentSchema = Joi.object({
+  orderRef: Joi.string().trim().required(),
 });
 
-export default { initiateBookingSchema, verifyPaymentSchema };
+export default { initiateBookingSchema, verifyPaymentSchema, retryPaymentSchema };
