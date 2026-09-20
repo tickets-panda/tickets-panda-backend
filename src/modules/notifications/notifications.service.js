@@ -1,4 +1,4 @@
-import { EmailLog } from '../../database/models/index.js';
+import prisma from '../../lib/prisma.js';
 import { sendMail, isMailConfigured } from '../../config/mailer.js';
 import { logger } from '../../utils/logger.js';
 import { emailTemplates } from '../../templates/emails/index.js';
@@ -30,21 +30,23 @@ export async function sendTemplateEmail({
   } catch (err) {
     status = 'FAILED';
     errorMessage = err.message;
-    sentAt = null;
+    sentAt = new Date();
     logger.error(`Email "${template}" to ${to} failed: ${err.message}`);
   }
 
   try {
-    await EmailLog.create({
-      tenantId,
-      toEmail: to,
-      subject,
-      templateName,
-      refType,
-      refId,
-      status,
-      errorMessage,
-      sentAt,
+    await prisma.emailLog.create({
+      data: {
+        tenantId: tenantId ? Number(tenantId) : null,
+        toEmail: to,
+        subject,
+        templateName,
+        refType,
+        refId: refId ? Number(refId) : null,
+        status,
+        errorMessage,
+        sentAt,
+      },
     });
   } catch (err) {
     logger.error(`Failed to record email log: ${err.message}`);

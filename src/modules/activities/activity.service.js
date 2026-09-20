@@ -1,12 +1,4 @@
-import { Op } from 'sequelize';
-import {
-  Activity,
-  Event,
-  TicketType,
-  Registration,
-  Ticket,
-  Checkin,
-} from '../../database/models/index.js';
+import prisma from '../../lib/prisma.js';
 import { NotFoundError, ConflictError } from '../../utils/errors.js';
 import { uniqueSlug } from '../../utils/generators.js';
 import { pick } from '../../utils/helpers.js';
@@ -30,28 +22,49 @@ const ACTIVITY_FIELDS = [
   'sortOrder',
 ];
 
+const sanitizeActivityData = (payload) => {
+  const data = pick(payload, ACTIVITY_FIELDS);
+  if (data.startsAt && typeof data.startsAt === 'string') {
+    data.startsAt = new Date(data.startsAt);
+  }
+  if (data.endsAt && typeof data.endsAt === 'string') {
+    data.endsAt = new Date(data.endsAt);
+  }
+  if (data.capacity !== undefined && data.capacity !== null) {
+    data.capacity = Number(data.capacity);
+  }
+  if (data.sortOrder !== undefined && data.sortOrder !== null) {
+    data.sortOrder = Number(data.sortOrder);
+  }
+  return data;
+};
+
 export async function createActivity(tenantId, eventId, userId, payload, req) {
-  await assertEventInTenant(tenantId, eventId);
+  const tId = Number(tenantId);
+  const eId = Number(eventId);
+  await assertEventInTenant(tId, eId);
 
   const slug = await uniqueSlug(payload.title, async (candidate) =>
-    Boolean(await Activity.findOne({ where: { eventId, slug: candidate } })),
+    Boolean(await prisma.activity.findFirst({ where: { eventId: eId, slug: candidate } })),
   );
 
-  const activity = await Activity.create({
-    ...pick(payload, ACTIVITY_FIELDS),
-    slug,
-    tenantId,
-    eventId,
-    status: payload.status || 'DRAFT',
+  const activity = await prisma.activity.create({
+    data: {
+      ...sanitizeActivityData(payload),
+      slug,
+      tenantId: tId,
+      eventId: eId,
+      status: payload.status || 'DRAFT',
+    },
   });
 
   await recordAudit({
-    tenantId,
+    tenantId: tId,
     userId,
     action: AUDIT_ACTIONS.ACTIVITY_CREATED,
     entityType: 'activity',
     entityId: activity.id,
-    details: { title: activity.title, slug, eventId },
+    details: { title: activity.title, slug, eventId: eId },
     req,
   });
 
@@ -59,61 +72,74 @@ export async function createActivity(tenantId, eventId, userId, payload, req) {
 }
 
 export async function listActivities(tenantId, eventId, query) {
-  await assertEventInTenant(tenantId, eventId);
+  const tId = Number(tenantId);
+  const eId = Number(eventId);
+  await assertEventInTenant(tId, eId);
 
   const { page, limit, offset } = parsePagination(query);
-  const where = { tenantId, eventId };
+  const where = { tenantId: tId, eventId: eId };
   if (query.status) where.status = query.status;
-  if (query.search) where.title = { [Op.like]: `%${query.search}%` };
+  if (query.search) where.title = { contains: query.search };
 
-  const { rows, count } = await Activity.findAndCountAll({
-    where,
-    include: [
-      { model: TicketType, as: 'ticketTypes', attributes: ['id', 'name', 'price', 'quantity', 'soldCount', 'isActive'] },
-    ],
-    order: [['sortOrder', 'ASC'], ['createdAt', 'ASC']],
-    limit,
-    offset,
-    distinct: true,
-  });
+  const [count, rows] = await Promise.all([
+    prisma.activity.count({ where }),
+    prisma.activity.findMany({
+      where,
+      skip: offset,
+      take: limit,
+      orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+      include: {
+        ticketTypes: {
+          select: { id: true, name: true, price: true, quantity: true, soldCount: true, isActive: true },
+        },
+      },
+    }),
+  ]);
 
   return { rows, pagination: buildPagination(count, page, limit) };
 }
 
 export async function getActivity(tenantId, activityId) {
-  const activity = await Activity.findOne({
-    where: { id: activityId, tenantId },
-    include: [
-      { model: Event, as: 'event', attributes: ['id', 'title', 'slug', 'status'] },
-      { model: TicketType, as: 'ticketTypes', separate: true, order: [['sortOrder', 'ASC']] },
-    ],
+  const tId = Number(tenantId);
+  const aId = Number(activityId);
+  const activity = await prisma.activity.findFirst({
+    where: { id: aId, tenantId: tId },
+    include: {
+      event: { select: { id: true, title: true, slug: true, status: true } },
+      ticketTypes: { orderBy: { sortOrder: 'asc' } },
+    },
   });
   if (!activity) throw new NotFoundError('Activity not found');
 
   const [confirmedRegistrations, ticketsSold, checkedIn] = await Promise.all([
-    Registration.count({ where: { activityId: activity.id, tenantId, status: 'CONFIRMED' } }),
-    Ticket.count({ where: { activityId: activity.id, tenantId } }),
-    Checkin.count({ where: { activityId: activity.id, tenantId } }),
+    prisma.registration.count({ where: { activityId: activity.id, tenantId: tId, status: 'CONFIRMED' } }),
+    prisma.ticket.count({ where: { activityId: activity.id, tenantId: tId } }),
+    prisma.checkin.count({ where: { activityId: activity.id, tenantId: tId } }),
   ]);
 
   return { activity, stats: { confirmedRegistrations, ticketsSold, checkedIn } };
 }
 
 export async function updateActivity(tenantId, activityId, payload, userId, req) {
-  const activity = await Activity.findOne({ where: { id: activityId, tenantId } });
+  const tId = Number(tenantId);
+  const aId = Number(activityId);
+  const activity = await prisma.activity.findFirst({ where: { id: aId, tenantId: tId } });
   if (!activity) throw new NotFoundError('Activity not found');
 
-  const changes = pick(payload, ACTIVITY_FIELDS);
+  const changes = sanitizeActivityData(payload);
   if (changes.title && changes.title !== activity.title) {
     changes.slug = await uniqueSlug(changes.title, async (candidate) =>
-      Boolean(await Activity.findOne({ where: { eventId: activity.eventId, slug: candidate, id: { [Op.ne]: activityId } } })),
+      Boolean(await prisma.activity.findFirst({ where: { eventId: activity.eventId, slug: candidate, id: { not: aId } } })),
     );
   }
 
-  await activity.update(changes);
+  const updated = await prisma.activity.update({
+    where: { id: activity.id },
+    data: changes,
+  });
 
   await recordAudit({
-    tenantId,
+    tenantId: tId,
     userId,
     action: AUDIT_ACTIONS.ACTIVITY_UPDATED,
     entityType: 'activity',
@@ -122,23 +148,28 @@ export async function updateActivity(tenantId, activityId, payload, userId, req)
     req,
   });
 
-  return activity;
+  return updated;
 }
 
 export async function changeActivityStatus(tenantId, activityId, status, userId, req) {
-  const activity = await Activity.findOne({ where: { id: activityId, tenantId } });
+  const tId = Number(tenantId);
+  const aId = Number(activityId);
+  const activity = await prisma.activity.findFirst({ where: { id: aId, tenantId: tId } });
   if (!activity) throw new NotFoundError('Activity not found');
 
   if (status === 'PUBLISHED') {
-    const ticketTypeCount = await TicketType.count({ where: { activityId: activity.id, isActive: true } });
+    const ticketTypeCount = await prisma.ticketType.count({ where: { activityId: activity.id, isActive: true } });
     if (!ticketTypeCount) throw new ConflictError('Add at least one active ticket type before publishing');
   }
 
   const previousStatus = activity.status;
-  await activity.update({ status });
+  const updated = await prisma.activity.update({
+    where: { id: activity.id },
+    data: { status },
+  });
 
   await recordAudit({
-    tenantId,
+    tenantId: tId,
     userId,
     action: AUDIT_ACTIONS.ACTIVITY_STATUS_CHANGED,
     entityType: 'activity',
@@ -147,33 +178,37 @@ export async function changeActivityStatus(tenantId, activityId, status, userId,
     req,
   });
 
-  return activity;
+  return updated;
 }
 
 export async function deleteActivity(tenantId, activityId, userId, req) {
-  const activity = await Activity.findOne({ where: { id: activityId, tenantId } });
+  const tId = Number(tenantId);
+  const aId = Number(activityId);
+  const activity = await prisma.activity.findFirst({ where: { id: aId, tenantId: tId } });
   if (!activity) throw new NotFoundError('Activity not found');
 
-  const confirmed = await Registration.count({ where: { activityId, tenantId, status: 'CONFIRMED' } });
+  const confirmed = await prisma.registration.count({ where: { activityId: aId, tenantId: tId, status: 'CONFIRMED' } });
   if (confirmed > 0) throw new ConflictError('This activity has confirmed bookings — cancel it instead of deleting');
 
-  await activity.destroy();
+  await prisma.activity.delete({ where: { id: activity.id } });
 
   await recordAudit({
-    tenantId,
+    tenantId: tId,
     userId,
     action: AUDIT_ACTIONS.ACTIVITY_DELETED,
     entityType: 'activity',
-    entityId: activityId,
+    entityId: aId,
     details: { title: activity.title },
     req,
   });
 
-  return { id: activityId };
+  return { id: aId };
 }
 
 export async function assertActivityInTenant(tenantId, activityId) {
-  const activity = await Activity.findOne({ where: { id: activityId, tenantId } });
+  const activity = await prisma.activity.findFirst({
+    where: { id: Number(activityId), tenantId: Number(tenantId) },
+  });
   if (!activity) throw new NotFoundError('Activity not found');
   return activity;
 }

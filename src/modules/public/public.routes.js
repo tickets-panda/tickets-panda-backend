@@ -7,6 +7,7 @@ const router = Router();
 
 router.use(publicRateLimiter);
 
+router.get('/events', catchAsync(controller.listAllEvents));
 router.get('/t/:tenantSlug', catchAsync(controller.getTenant));
 router.get('/t/:tenantSlug/events', catchAsync(controller.listEvents));
 router.get('/t/:tenantSlug/events/:eventSlug', catchAsync(controller.getEvent));

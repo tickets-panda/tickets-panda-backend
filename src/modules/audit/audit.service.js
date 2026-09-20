@@ -1,4 +1,4 @@
-import { AuditLog } from '../../database/models/index.js';
+import prisma from '../../lib/prisma.js';
 import { logger } from '../../utils/logger.js';
 
 const clientIp = (req) =>
@@ -9,15 +9,17 @@ const clientIp = (req) =>
  */
 export async function recordAudit({ tenantId = null, userId = null, action, entityType, entityId = null, details = null, req = null }) {
   try {
-    await AuditLog.create({
-      tenantId,
-      userId,
-      action,
-      entityType,
-      entityId,
-      details: details || null,
-      ipAddress: req ? clientIp(req) : null,
-      userAgent: req?.headers?.['user-agent']?.slice(0, 500) || null,
+    await prisma.auditLog.create({
+      data: {
+        tenantId: tenantId ? Number(tenantId) : null,
+        userId: userId ? Number(userId) : null,
+        action,
+        entityType,
+        entityId: entityId ? Number(entityId) : null,
+        details: details || undefined,
+        ipAddress: req ? clientIp(req) : null,
+        userAgent: req?.headers?.['user-agent']?.slice(0, 255) || null,
+      },
     });
   } catch (err) {
     logger.error(`Failed to write audit log (${action}): ${err.message}`);

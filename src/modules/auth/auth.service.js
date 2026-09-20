@@ -1,6 +1,5 @@
 import bcrypt from 'bcryptjs';
-import { Op } from 'sequelize';
-import { sequelize, User, Tenant, TenantMember, OtpVerification } from '../../database/models/index.js';
+import prisma from '../../lib/prisma.js';
 import { ConflictError, UnauthorizedError, NotFoundError, ValidationError } from '../../utils/errors.js';
 import { normaliseEmail } from '../../utils/helpers.js';
 import { uniqueSlug, generateResetToken } from '../../utils/generators.js';
@@ -17,20 +16,27 @@ const tenantIsUsable = (tenant) => tenant && !['SUSPENDED', 'INACTIVE'].includes
 export async function registerTenant({ name, email, password, phone, websiteUrl }, req) {
   const normalised = normaliseEmail(email);
 
-  const existingUser = await User.findOne({ where: { email: normalised } });
+  const existingUser = await prisma.user.findUnique({ where: { email: normalised } });
   if (existingUser) throw new ConflictError('An account with this email already exists');
 
-  const existingTenant = await Tenant.findOne({ where: { email: normalised } });
+  const existingTenant = await prisma.tenant.findUnique({ where: { email: normalised } });
   if (existingTenant) throw new ConflictError('An organization with this email already exists');
 
   const passwordHash = await bcrypt.hash(password, 12);
-  const slug = await uniqueSlug(name, async (candidate) => Boolean(await Tenant.findOne({ where: { slug: candidate } })));
+  const slug = await uniqueSlug(name, async (candidate) => Boolean(await prisma.tenant.findUnique({ where: { slug: candidate } })));
 
-  const result = await sequelize.transaction(async (t) => {
-    const user = await User.create({ name, email: normalised, passwordHash, phone: phone || null }, { transaction: t });
+  const result = await prisma.$transaction(async (tx) => {
+    const user = await tx.user.create({
+      data: {
+        name,
+        email: normalised,
+        passwordHash,
+        phone: phone || null,
+      },
+    });
 
-    const tenant = await Tenant.create(
-      {
+    const tenant = await tx.tenant.create({
+      data: {
         name,
         slug,
         email: normalised,
@@ -40,13 +46,16 @@ export async function registerTenant({ name, email, password, phone, websiteUrl 
         subscriptionPlan: 'FREE',
         settings: {},
       },
-      { transaction: t },
-    );
+    });
 
-    await TenantMember.create(
-      { userId: user.id, tenantId: tenant.id, role: 'TENANT_OWNER', isActive: true },
-      { transaction: t },
-    );
+    await tx.tenantMember.create({
+      data: {
+        userId: user.id,
+        tenantId: tenant.id,
+        role: 'TENANT_OWNER',
+        isActive: true,
+      },
+    });
 
     return { user, tenant };
   });
@@ -81,7 +90,7 @@ export async function registerTenant({ name, email, password, phone, websiteUrl 
 /** Authenticates a platform or tenant user and issues tokens. */
 export async function login({ email, password }, req) {
   const normalised = normaliseEmail(email);
-  const user = await User.findOne({ where: { email: normalised } });
+  const user = await prisma.user.findUnique({ where: { email: normalised } });
 
   if (!user) throw new UnauthorizedError('Invalid email or password');
   if (!user.isActive) throw new UnauthorizedError('This account has been deactivated');
@@ -93,13 +102,13 @@ export async function login({ email, password }, req) {
   let tenantId = null;
   let tenant = null;
 
-  if (PLATFORM_ROLES.includes(user.role)) {
+  if (user.role && PLATFORM_ROLES.includes(user.role)) {
     role = user.role;
   } else {
-    const membership = await TenantMember.findOne({
+    const membership = await prisma.tenantMember.findFirst({
       where: { userId: user.id, isActive: true },
-      include: [{ model: Tenant, as: 'tenant' }],
-      order: [['createdAt', 'ASC']],
+      include: { tenant: true },
+      orderBy: { createdAt: 'asc' },
     });
 
     if (!membership) throw new UnauthorizedError('No active organization is linked to this account');
@@ -110,7 +119,10 @@ export async function login({ email, password }, req) {
     tenantId = membership.tenantId;
   }
 
-  await user.update({ lastLoginAt: new Date() });
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { lastLoginAt: new Date() },
+  });
 
   const accessToken = signAccessToken({ id: user.id, email: user.email, role, tenantId });
   const refreshToken = signRefreshToken({ id: user.id });
@@ -151,17 +163,17 @@ export async function refreshAccessToken(refreshToken) {
     throw new UnauthorizedError('Invalid or expired refresh token');
   }
 
-  const user = await User.findOne({ where: { id: decoded.id } });
+  const user = await prisma.user.findUnique({ where: { id: decoded.id } });
   if (!user || !user.isActive) throw new UnauthorizedError('Account is not available');
 
   let role = user.role;
   let tenantId = null;
 
-  if (!PLATFORM_ROLES.includes(user.role)) {
-    const membership = await TenantMember.findOne({
+  if (!user.role || !PLATFORM_ROLES.includes(user.role)) {
+    const membership = await prisma.tenantMember.findFirst({
       where: { userId: user.id, isActive: true },
-      include: [{ model: Tenant, as: 'tenant' }],
-      order: [['createdAt', 'ASC']],
+      include: { tenant: true },
+      orderBy: { createdAt: 'asc' },
     });
     if (!membership || !tenantIsUsable(membership.tenant)) {
       throw new UnauthorizedError('This organization account is not active');
@@ -175,8 +187,13 @@ export async function refreshAccessToken(refreshToken) {
 
 /** Returns the profile for the authenticated user. */
 export async function getProfile(userId) {
-  const user = await User.findByPk(userId, {
-    include: [{ model: TenantMember, as: 'memberships', include: [{ model: Tenant, as: 'tenant' }] }],
+  const user = await prisma.user.findUnique({
+    where: { id: Number(userId) },
+    include: {
+      tenantMembers: {
+        include: { tenant: true },
+      },
+    },
   });
   if (!user) throw new NotFoundError('User not found');
   return {
@@ -185,7 +202,7 @@ export async function getProfile(userId) {
     email: user.email,
     phone: user.phone,
     role: user.role,
-    memberships: (user.memberships || []).map((m) => ({
+    memberships: (user.tenantMembers || []).map((m) => ({
       tenantId: m.tenantId,
       tenantName: m.tenant?.name,
       tenantSlug: m.tenant?.slug,
@@ -198,7 +215,7 @@ export async function getProfile(userId) {
 /** Emails a password-reset link. Always resolves to avoid leaking account existence. */
 export async function forgotPassword(email) {
   const normalised = normaliseEmail(email);
-  const user = await User.findOne({ where: { email: normalised } });
+  const user = await prisma.user.findUnique({ where: { email: normalised } });
   if (!user) {
     logger.info(`Password reset requested for unknown email: ${normalised}`);
     return { sent: false };
@@ -207,12 +224,14 @@ export async function forgotPassword(email) {
   const token = generateResetToken();
   const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
 
-  await OtpVerification.create({
-    identifier: normalised,
-    identifierType: 'EMAIL',
-    otp: token,
-    purpose: 'PASSWORD_RESET',
-    expiresAt,
+  await prisma.otpVerification.create({
+    data: {
+      identifier: normalised,
+      identifierType: 'EMAIL',
+      otp: token,
+      purpose: 'PASSWORD_RESET',
+      expiresAt,
+    },
   });
 
   const resetUrl = `${env.tenantUrl}/reset-password?token=${token}`;
@@ -229,23 +248,29 @@ export async function forgotPassword(email) {
 
 /** Completes a password reset using a previously issued token. */
 export async function resetPassword({ token, newPassword }) {
-  const record = await OtpVerification.findOne({
+  const record = await prisma.otpVerification.findFirst({
     where: {
       otp: token,
       purpose: 'PASSWORD_RESET',
       isUsed: false,
-      expiresAt: { [Op.gt]: new Date() },
+      expiresAt: { gt: new Date() },
     },
   });
 
   if (!record) throw new ValidationError('This reset link is invalid or has expired');
 
-  const user = await User.findOne({ where: { email: record.identifier } });
+  const user = await prisma.user.findUnique({ where: { email: record.identifier } });
   if (!user) throw new NotFoundError('User not found');
 
   const passwordHash = await bcrypt.hash(newPassword, 12);
-  await user.update({ passwordHash });
-  await record.update({ isUsed: true });
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { passwordHash },
+  });
+  await prisma.otpVerification.update({
+    where: { id: record.id },
+    data: { isUsed: true },
+  });
 
   return { email: user.email };
 }

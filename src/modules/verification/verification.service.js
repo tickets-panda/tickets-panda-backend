@@ -1,4 +1,4 @@
-import { sequelize, Ticket, Checkin, Event, Activity, TicketType, Customer, Order } from '../../database/models/index.js';
+import prisma from '../../lib/prisma.js';
 import { NotFoundError, ConflictError, ForbiddenError, ValidationError } from '../../utils/errors.js';
 import { parsePagination, buildPagination } from '../../utils/apiResponse.js';
 import { recordAudit } from '../audit/audit.service.js';
@@ -14,25 +14,31 @@ const normaliseToken = (value) => {
   return parts[parts.length - 1] || null;
 };
 
-const ticketInclude = [
-  { model: Event, as: 'event', attributes: ['id', 'title', 'eventDate', 'eventTimeStart', 'venueName'] },
-  { model: Activity, as: 'activity', attributes: ['id', 'title', 'slug', 'venue', 'startsAt'] },
-  { model: TicketType, as: 'ticketType', attributes: ['id', 'name'] },
-  { model: Customer, as: 'customer', attributes: ['id', 'name', 'email', 'phone'] },
-  { model: Checkin, as: 'checkin', attributes: ['id', 'checkedInAt', 'gateName'] },
-  { model: Order, as: 'order', attributes: ['id', 'orderRef'] },
-];
+const ticketInclude = {
+  event: { select: { id: true, title: true, eventDate: true, eventTimeStart: true, venueName: true } },
+  activity: { select: { id: true, title: true, slug: true, venue: true, startsAt: true } },
+  ticketType: { select: { id: true, name: true } },
+  customer: { select: { id: true, name: true, email: true, phone: true } },
+  checkins: { select: { id: true, checkedInAt: true, gateName: true } },
+  order: { select: { id: true, orderRef: true } },
+};
 
 /** Resolves a ticket by key or verification token, scoped to the staff member's tenant. */
 async function resolveTicket(tenantId, { ticketKey, verificationToken, token }) {
-  const where = { tenantId };
+  const tId = Number(tenantId);
+  const where = { tenantId: tId };
   if (ticketKey) where.ticketKey = String(ticketKey).trim().toUpperCase();
   else if (verificationToken) where.verificationToken = normaliseToken(verificationToken);
   else if (token) where.verificationToken = normaliseToken(token);
   else throw new ValidationError('Provide a ticket key or a scanned QR token');
 
-  const ticket = await Ticket.findOne({ where, include: ticketInclude });
-  return ticket;
+  const ticket = await prisma.ticket.findFirst({ where, include: ticketInclude });
+  if (!ticket) return null;
+
+  return {
+    ...ticket,
+    checkin: ticket.checkins?.[0] || null,
+  };
 }
 
 const assertEventAccess = (user, assignedEvents, eventId) => {
@@ -42,22 +48,21 @@ const assertEventAccess = (user, assignedEvents, eventId) => {
 };
 
 function describe(ticket) {
-  const plain = ticket.toJSON();
   const base = {
-    ticketKey: plain.ticketKey,
-    status: plain.status,
-    holder: plain.customer ? { name: plain.customer.name, email: plain.customer.email } : null,
-    ticketType: plain.ticketType?.name || null,
-    event: plain.event,
-    activity: plain.activity ? { id: plain.activity.id, title: plain.activity.title, slug: plain.activity.slug } : null,
-    order: plain.order?.orderRef || null,
-    checkedInAt: plain.checkin?.checkedInAt || null,
-    gateName: plain.checkin?.gateName || null,
+    ticketKey: ticket.ticketKey,
+    status: ticket.status,
+    holder: ticket.customer ? { name: ticket.customer.name, email: ticket.customer.email } : null,
+    ticketType: ticket.ticketType?.name || null,
+    event: ticket.event,
+    activity: ticket.activity ? { id: ticket.activity.id, title: ticket.activity.title, slug: ticket.activity.slug } : null,
+    order: ticket.order?.orderRef || null,
+    checkedInAt: ticket.checkin?.checkedInAt || null,
+    gateName: ticket.checkin?.gateName || null,
   };
 
-  if (plain.status === 'ACTIVE') return { valid: true, result: 'VALID', ...base };
-  if (plain.status === 'USED') return { valid: false, result: 'ALREADY_USED', ...base };
-  return { valid: false, result: plain.status, ...base };
+  if (ticket.status === 'ACTIVE') return { valid: true, result: 'VALID', ...base };
+  if (ticket.status === 'USED') return { valid: false, result: 'ALREADY_USED', ...base };
+  return { valid: false, result: ticket.status, ...base };
 }
 
 /** Read-only verification (scan preview) — never mutates state. */
@@ -110,26 +115,33 @@ export async function checkIn(user, assignedEvents, payload, req) {
     throw new NotFoundError(preview.message || 'Ticket is not valid for entry');
   }
 
-  const ticket = await Ticket.findOne({ where: { tenantId: user.tenantId, ticketKey: preview.ticketKey } });
+  const ticket = await prisma.ticket.findFirst({
+    where: { tenantId: Number(user.tenantId), ticketKey: preview.ticketKey },
+  });
+  if (!ticket) throw new NotFoundError('Ticket not found');
 
-  const checkin = await sequelize.transaction(async (t) => {
-    // Re-lock the ticket so two scanners cannot both check it in.
-    const locked = await Ticket.findByPk(ticket.id, { lock: t.LOCK.UPDATE, transaction: t });
+  const checkin = await prisma.$transaction(async (tx) => {
+    // Re-lock the ticket in MySQL so two scanners cannot both check it in.
+    const [locked] = await tx.$queryRaw`SELECT * FROM tickets WHERE id = ${ticket.id} FOR UPDATE`;
+    if (!locked) throw new NotFoundError('Ticket not found');
     if (locked.status !== 'ACTIVE') throw new ConflictError('This ticket has already been checked in');
 
-    await locked.update({ status: 'USED' }, { transaction: t });
-    return Checkin.create(
-      {
-        ticketId: locked.id,
-        tenantId: locked.tenantId,
-        eventId: locked.eventId,
-        activityId: locked.activityId || null,
-        checkedInBy: user.id,
+    await tx.ticket.update({
+      where: { id: ticket.id },
+      data: { status: 'USED' },
+    });
+
+    return tx.checkin.create({
+      data: {
+        ticketId: ticket.id,
+        tenantId: ticket.tenantId,
+        eventId: ticket.eventId,
+        activityId: ticket.activityId || null,
+        checkedInBy: user.id ? Number(user.id) : null,
         gateName: payload.gateName || null,
         checkedInAt: new Date(),
       },
-      { transaction: t },
-    );
+    });
   });
 
   await recordAudit({
@@ -142,7 +154,6 @@ export async function checkIn(user, assignedEvents, payload, req) {
     req,
   });
 
-  // Spread the preview first so the check-in result overrides its VALID result.
   return {
     ...preview,
     valid: true,
@@ -155,40 +166,52 @@ export async function checkIn(user, assignedEvents, payload, req) {
 
 /** Live gate statistics for an event. */
 export async function gateStats(user, assignedEvents, eventId) {
-  assertEventAccess(user, assignedEvents, eventId);
+  const tId = Number(user.tenantId);
+  const eId = Number(eventId);
+  assertEventAccess(user, assignedEvents, eId);
 
-  const event = await Event.findOne({ where: { id: eventId, tenantId: user.tenantId } });
+  const event = await prisma.event.findFirst({ where: { id: eId, tenantId: tId } });
   if (!event) throw new NotFoundError('Event not found');
 
-  const totalTickets = await Ticket.count({ where: { tenantId: user.tenantId, eventId } });
-  const checkedIn = await Checkin.count({ where: { tenantId: user.tenantId, eventId } });
-
-  const ticketTypes = await TicketType.findAll({
-    where: { tenantId: user.tenantId, eventId },
-    attributes: ['id', 'name', 'quantity'],
-    raw: true,
-  });
+  const [totalTickets, checkedIn, ticketTypes] = await Promise.all([
+    prisma.ticket.count({ where: { tenantId: tId, eventId: eId } }),
+    prisma.checkin.count({ where: { tenantId: tId, eventId: eId } }),
+    prisma.ticketType.findMany({
+      where: { tenantId: tId, eventId: eId },
+      select: { id: true, name: true, quantity: true },
+    }),
+  ]);
 
   const byTicketType = await Promise.all(
     ticketTypes.map(async (type) => {
       const [total, entered] = await Promise.all([
-        Ticket.count({ where: { tenantId: user.tenantId, eventId, ticketTypeId: type.id } }),
-        Checkin.count({
-          where: { tenantId: user.tenantId, eventId },
-          include: [{ model: Ticket, as: 'ticket', where: { ticketTypeId: type.id }, attributes: [] }],
+        prisma.ticket.count({ where: { tenantId: tId, eventId: eId, ticketTypeId: type.id } }),
+        prisma.checkin.count({
+          where: {
+            tenantId: tId,
+            eventId: eId,
+            ticket: { ticketTypeId: type.id },
+          },
         }),
       ]);
       return { name: type.name, total, checkedIn: entered };
     }),
   );
 
-  const recent = await Checkin.findAll({
-    where: { tenantId: user.tenantId, eventId },
-    include: [
-      { model: Ticket, as: 'ticket', attributes: ['ticketKey'], include: [{ model: Customer, as: 'customer', attributes: ['id', 'name'] }] },
-    ],
-    order: [['checkedInAt', 'DESC']],
-    limit: 10,
+  const recent = await prisma.checkin.findMany({
+    where: { tenantId: tId, eventId: eId },
+    include: {
+      ticket: {
+        select: {
+          ticketKey: true,
+          customer: {
+            select: { id: true, name: true },
+          },
+        },
+      },
+    },
+    orderBy: { checkedInAt: 'desc' },
+    take: 10,
   });
 
   return {
@@ -209,15 +232,23 @@ export async function gateStats(user, assignedEvents, eventId) {
 
 /** Paginated check-in list for a single event (tenant-facing). */
 export async function eventCheckins(tenantId, eventId, query) {
+  const tId = Number(tenantId);
+  const eId = Number(eventId);
   const { page, limit, offset } = parsePagination(query);
-  const { rows, count } = await Checkin.findAndCountAll({
-    where: { tenantId, eventId },
-    include: [{ model: Ticket, as: 'ticket', attributes: ['id', 'ticketKey'] }],
-    order: [['checkedInAt', 'DESC']],
-    limit,
-    offset,
-    distinct: true,
-  });
+
+  const [count, rows] = await Promise.all([
+    prisma.checkin.count({ where: { tenantId: tId, eventId: eId } }),
+    prisma.checkin.findMany({
+      where: { tenantId: tId, eventId: eId },
+      skip: offset,
+      take: limit,
+      orderBy: { checkedInAt: 'desc' },
+      include: {
+        ticket: { select: { id: true, ticketKey: true } },
+      },
+    }),
+  ]);
+
   return { rows, pagination: buildPagination(count, page, limit) };
 }
 

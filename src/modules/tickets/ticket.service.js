@@ -1,5 +1,5 @@
 import QRCode from 'qrcode';
-import { Ticket } from '../../database/models/index.js';
+import prisma from '../../lib/prisma.js';
 import { generateTicketKey, generateVerificationToken } from '../../utils/generators.js';
 import { env } from '../../config/env.js';
 
@@ -9,7 +9,8 @@ const MAX_KEY_ATTEMPTS = 5;
  * Creates `registration.quantity` tickets for a paid order.
  * Must be called inside the payment-confirmation transaction.
  */
-export async function generateTicketsForOrder({ order, registration, transaction }) {
+export async function generateTicketsForOrder({ order, registration, transaction, tx }) {
+  const db = tx || transaction || prisma;
   const tickets = [];
 
   for (let i = 0; i < registration.quantity; i += 1) {
@@ -17,7 +18,7 @@ export async function generateTicketsForOrder({ order, registration, transaction
 
     for (let attempt = 0; attempt < MAX_KEY_ATTEMPTS; attempt += 1) {
       const candidate = generateTicketKey();
-      const exists = await Ticket.findOne({ where: { ticketKey: candidate }, transaction });
+      const exists = await db.ticket.findUnique({ where: { ticketKey: candidate } });
       if (!exists) {
         ticketKey = candidate;
         break;
@@ -31,8 +32,8 @@ export async function generateTicketsForOrder({ order, registration, transaction
     // QR encodes only an opaque verification URL — never customer PII.
     const qrData = await QRCode.toDataURL(verifyUrl, { margin: 1, width: 320 });
 
-    const ticket = await Ticket.create(
-      {
+    const ticket = await db.ticket.create({
+      data: {
         ticketKey,
         verificationToken,
         tenantId: order.tenantId,
@@ -45,8 +46,7 @@ export async function generateTicketsForOrder({ order, registration, transaction
         status: 'ACTIVE',
         qrData,
       },
-      { transaction },
-    );
+    });
 
     tickets.push(ticket);
   }
@@ -56,7 +56,7 @@ export async function generateTicketsForOrder({ order, registration, transaction
 
 /** Human-facing ticket payload (safe to return to the buyer). */
 export function serialiseTicket(ticket) {
-  const plain = typeof ticket.toJSON === 'function' ? ticket.toJSON() : ticket;
+  const plain = typeof ticket?.toJSON === 'function' ? ticket.toJSON() : ticket;
   return {
     id: plain.id,
     ticketKey: plain.ticketKey,

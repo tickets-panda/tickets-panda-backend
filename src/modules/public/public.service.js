@@ -1,13 +1,4 @@
-import { Op } from 'sequelize';
-import {
-  Tenant,
-  Event,
-  Activity,
-  TicketType,
-  RegistrationForm,
-  Registration,
-  Checkin,
-} from '../../database/models/index.js';
+import prisma from '../../lib/prisma.js';
 import { NotFoundError } from '../../utils/errors.js';
 import { resolveVerificationToken } from '../customers/customer.service.js';
 
@@ -17,9 +8,19 @@ const remainingFor = (ticketType) => Math.max(0, ticketType.quantity - ticketTyp
 
 /** Public tenant profile shown on the tenant's event landing page. */
 export async function getTenantBySlug(slug) {
-  const tenant = await Tenant.findOne({
-    where: { slug, status: { [Op.ne]: 'INACTIVE' } },
-    attributes: ['id', 'name', 'slug', 'logoUrl', 'websiteUrl', 'description', 'address', 'settings', 'status'],
+  const tenant = await prisma.tenant.findUnique({
+    where: { slug },
+    select: {
+      id: true,
+      name: true,
+      slug: true,
+      logoUrl: true,
+      websiteUrl: true,
+      description: true,
+      address: true,
+      settings: true,
+      status: true,
+    },
   });
   if (!tenant || !tenantIsPublic(tenant)) throw new NotFoundError('This organizer page is not available');
   return tenant;
@@ -29,20 +30,43 @@ export async function getTenantBySlug(slug) {
 export async function listTenantEvents(slug) {
   const tenant = await getTenantBySlug(slug);
 
-  const events = await Event.findAll({
+  const events = await prisma.event.findMany({
     where: { tenantId: tenant.id, status: 'LIVE' },
-    attributes: ['id', 'title', 'slug', 'description', 'bannerUrl', 'venueName', 'venueAddress', 'eventDate', 'eventTimeStart', 'eventTimeEnd', 'maxCapacity'],
-    include: [{ model: TicketType, as: 'ticketTypes', where: { isActive: true }, required: false, attributes: ['id', 'name', 'price', 'currency', 'quantity', 'soldCount', 'minPerOrder', 'maxPerOrder'] }],
-    order: [['eventDate', 'ASC']],
+    select: {
+      id: true,
+      title: true,
+      slug: true,
+      description: true,
+      bannerUrl: true,
+      venueName: true,
+      venueAddress: true,
+      eventDate: true,
+      eventTimeStart: true,
+      eventTimeEnd: true,
+      maxCapacity: true,
+      ticketTypes: {
+        where: { isActive: true },
+        select: {
+          id: true,
+          name: true,
+          price: true,
+          currency: true,
+          quantity: true,
+          soldCount: true,
+          minPerOrder: true,
+          maxPerOrder: true,
+        },
+      },
+    },
+    orderBy: { eventDate: 'asc' },
   });
 
   return {
     tenant,
     events: events.map((event) => {
-      const plain = event.toJSON();
-      const ticketTypes = (plain.ticketTypes || []).map((t) => ({ ...t, remaining: remainingFor(t) }));
+      const ticketTypes = (event.ticketTypes || []).map((t) => ({ ...t, remaining: remainingFor(t) }));
       return {
-        ...plain,
+        ...event,
         ticketTypes,
         priceFrom: ticketTypes.length ? Math.min(...ticketTypes.map((t) => Number(t.price))) : null,
         soldOut: ticketTypes.length > 0 && ticketTypes.every((t) => t.remaining === 0),
@@ -55,31 +79,27 @@ export async function listTenantEvents(slug) {
 export async function getPublicEvent(slug, eventSlug) {
   const tenant = await getTenantBySlug(slug);
 
-  const event = await Event.findOne({
+  const event = await prisma.event.findFirst({
     where: { tenantId: tenant.id, slug: eventSlug, status: 'LIVE' },
-    include: [
-      { model: TicketType, as: 'ticketTypes', where: { isActive: true }, required: false },
-      { model: RegistrationForm, as: 'formFields' },
-      {
-        model: Activity,
-        as: 'activities',
+    include: {
+      ticketTypes: { where: { isActive: true } },
+      registrationForms: true,
+      activities: {
         where: { status: 'PUBLISHED' },
-        required: false,
-        include: [
-          { model: TicketType, as: 'ticketTypes', where: { isActive: true }, required: false },
-        ],
+        include: {
+          ticketTypes: { where: { isActive: true } },
+        },
       },
-    ],
+    },
   });
 
   if (!event) throw new NotFoundError('Event not found or not open for registration');
 
-  const plain = event.toJSON();
-  const ticketTypes = (plain.ticketTypes || [])
+  const ticketTypes = (event.ticketTypes || [])
     .sort((a, b) => a.sortOrder - b.sortOrder)
     .map((t) => ({ ...t, remaining: remainingFor(t) }));
 
-  const activities = (plain.activities || [])
+  const activities = (event.activities || [])
     .sort((a, b) => a.sortOrder - b.sortOrder)
     .map((act) => ({
       id: act.id,
@@ -99,7 +119,7 @@ export async function getPublicEvent(slug, eventSlug) {
         .map((t) => ({ ...t, remaining: remainingFor(t) })),
     }));
 
-  const formFields = (plain.formFields || [])
+  const formFields = (event.registrationForms || [])
     .sort((a, b) => a.sortOrder - b.sortOrder)
     .map((f) => ({
       id: f.id,
@@ -113,17 +133,17 @@ export async function getPublicEvent(slug, eventSlug) {
       fileConfig: f.fileConfig,
     }));
 
-  const [confirmedRegistrations, checkedIn] = await Promise.all([
-    Registration.count({ where: { eventId: event.id, tenantId: tenant.id, status: 'CONFIRMED' } }),
-    Checkin.count({ where: { eventId: event.id, tenantId: tenant.id } }),
+  const [confirmedRegistrations, checkedIn, claimedAgg] = await Promise.all([
+    prisma.registration.count({ where: { eventId: event.id, tenantId: tenant.id, status: 'CONFIRMED' } }),
+    prisma.checkin.count({ where: { eventId: event.id, tenantId: tenant.id } }),
+    prisma.registration.aggregate({
+      _sum: { quantity: true },
+      where: { eventId: event.id, tenantId: tenant.id, status: 'CONFIRMED' },
+    }),
   ]);
 
-  const seatsClaimed = await Registration.sum('quantity', {
-    where: { eventId: event.id, tenantId: tenant.id, status: 'CONFIRMED' },
-  });
-
-  const registrationOpen =
-    !event.registrationDeadline || new Date(event.registrationDeadline) > new Date();
+  const seatsClaimed = Number(claimedAgg._sum.quantity || 0);
+  const registrationOpen = !event.registrationDeadline || new Date(event.registrationDeadline) > new Date();
 
   return {
     tenant: { id: tenant.id, name: tenant.name, slug: tenant.slug, logoUrl: tenant.logoUrl },
@@ -157,10 +177,10 @@ export async function getPublicEvent(slug, eventSlug) {
     formFields,
     stats: {
       confirmedRegistrations,
-      seatsClaimed: seatsClaimed || 0,
+      seatsClaimed,
       checkedIn,
       maxCapacity: event.maxCapacity,
-      seatsRemaining: event.maxCapacity ? Math.max(0, event.maxCapacity - (seatsClaimed || 0)) : null,
+      seatsRemaining: event.maxCapacity ? Math.max(0, event.maxCapacity - seatsClaimed) : null,
     },
   };
 }
@@ -169,27 +189,26 @@ export async function getPublicEvent(slug, eventSlug) {
 export async function getPublicActivity(tenantSlug, eventSlug, activitySlug) {
   const tenant = await getTenantBySlug(tenantSlug);
 
-  const event = await Event.findOne({
+  const event = await prisma.event.findFirst({
     where: { tenantId: tenant.id, slug: eventSlug, status: 'LIVE' },
-    attributes: ['id', 'title', 'slug', 'eventDate', 'eventTimeStart', 'venueName'],
+    select: { id: true, title: true, slug: true, eventDate: true, eventTimeStart: true, venueName: true },
   });
   if (!event) throw new NotFoundError('Event not found or not open');
 
-  const activity = await Activity.findOne({
+  const activity = await prisma.activity.findFirst({
     where: { eventId: event.id, tenantId: tenant.id, slug: activitySlug, status: 'PUBLISHED' },
-    include: [
-      { model: TicketType, as: 'ticketTypes', where: { isActive: true }, required: false },
-      { model: RegistrationForm, as: 'formFields', separate: true, order: [['sortOrder', 'ASC']] },
-    ],
+    include: {
+      ticketTypes: { where: { isActive: true } },
+      formFields: { orderBy: { sortOrder: 'asc' } },
+    },
   });
   if (!activity) throw new NotFoundError('Activity not found or not open for registration');
 
-  const plain = activity.toJSON();
-  const ticketTypes = (plain.ticketTypes || [])
+  const ticketTypes = (activity.ticketTypes || [])
     .sort((a, b) => a.sortOrder - b.sortOrder)
     .map((t) => ({ ...t, remaining: remainingFor(t) }));
 
-  const formFields = (plain.formFields || [])
+  const formFields = (activity.formFields || [])
     .sort((a, b) => a.sortOrder - b.sortOrder)
     .map((f) => ({
       id: f.id,
@@ -231,4 +250,52 @@ export async function getPublicForm(slug, eventSlug) {
   return formFields;
 }
 
-export default { getTenantBySlug, listTenantEvents, getPublicEvent, getPublicActivity, getPublicForm, resolveVerificationToken };
+/** Lists all live public events across all active tenants. */
+export async function listAllPublicEvents({ search, limit = 50 } = {}) {
+  const where = {
+    status: 'LIVE',
+    tenant: { status: 'ACTIVE' },
+  };
+  if (search) {
+    where.title = { contains: search };
+  }
+
+  const events = await prisma.event.findMany({
+    where,
+    include: {
+      tenant: {
+        select: { id: true, name: true, slug: true, logoUrl: true },
+      },
+      ticketTypes: {
+        where: { isActive: true },
+        select: { id: true, name: true, price: true, currency: true, quantity: true, soldCount: true },
+      },
+      activities: {
+        where: { status: 'PUBLISHED' },
+        select: { id: true, title: true, slug: true, capacity: true },
+      },
+    },
+    orderBy: { eventDate: 'asc' },
+    take: Math.min(Number(limit) || 50, 100),
+  });
+
+  return events.map((event) => {
+    const ticketTypes = (event.ticketTypes || []).map((t) => ({ ...t, remaining: remainingFor(t) }));
+    return {
+      ...event,
+      ticketTypes,
+      priceFrom: ticketTypes.length ? Math.min(...ticketTypes.map((t) => Number(t.price))) : null,
+      soldOut: ticketTypes.length > 0 && ticketTypes.every((t) => t.remaining === 0),
+    };
+  });
+}
+
+export default {
+  getTenantBySlug,
+  listTenantEvents,
+  listAllPublicEvents,
+  getPublicEvent,
+  getPublicActivity,
+  getPublicForm,
+  resolveVerificationToken,
+};

@@ -23,17 +23,13 @@ export const env = {
   tenantUrl: str('TENANT_DASHBOARD_URL', 'http://localhost:3000'),
   platformUrl: str('PLATFORM_ADMIN_URL', 'http://localhost:3000'),
 
+  databaseUrl: str('DATABASE_URL', 'mysql://ticketpanda:ticketpanda@localhost:3306/ticket_panda_dev'),
   db: {
-    // "mysql" (production default) or "sqlite" for zero-setup local development.
-    dialect: str('DB_DIALECT', 'mysql').toLowerCase() === 'sqlite' ? 'sqlite' : 'mysql',
-    storage: str('DB_STORAGE', './data/ticket-panda.sqlite'),
     host: str('DB_HOST', 'localhost'),
     port: num('DB_PORT', 3306),
-    name: str('DB_NAME', 'ticket_panda'),
-    user: str('DB_USER', 'root'),
-    password: str('DB_PASSWORD', ''),
-    poolMin: num('DB_POOL_MIN', 2),
-    poolMax: num('DB_POOL_MAX', 10),
+    name: str('DB_NAME', 'ticket_panda_dev'),
+    user: str('DB_USER', 'ticketpanda'),
+    password: str('DB_PASSWORD', 'ticketpanda'),
     logging: bool('DB_LOGGING', false),
   },
 

@@ -1,81 +1,92 @@
 import bcrypt from 'bcryptjs';
-import { Op, fn, col } from 'sequelize';
-import {
-  Tenant,
-  TenantMember,
-  User,
-  Event,
-  TicketType,
-  Registration,
-  RegistrationData,
-  RegistrationForm,
-  Order,
-  Payment,
-  Ticket,
-  Checkin,
-  Customer,
-  AuditLog,
-} from '../../database/models/index.js';
+import prisma from '../../lib/prisma.js';
 import { NotFoundError, ConflictError, ForbiddenError } from '../../utils/errors.js';
 import { normaliseEmail, pick } from '../../utils/helpers.js';
 import { parsePagination, buildPagination } from '../../utils/apiResponse.js';
 import { recordAudit } from '../audit/audit.service.js';
 import { AUDIT_ACTIONS } from '../../utils/constants.js';
 
-const scopedWhere = (tenantId, extra = {}) => ({ tenantId, ...extra });
-
 /* ----------------------------- Profile ----------------------------- */
 
 export async function getProfile(tenantId) {
-  const tenant = await Tenant.findByPk(tenantId);
+  const tenant = await prisma.tenant.findUnique({
+    where: { id: Number(tenantId) },
+  });
   if (!tenant) throw new NotFoundError('Tenant not found');
   return tenant;
 }
 
 export async function updateProfile(tenantId, payload) {
-  const tenant = await Tenant.findByPk(tenantId);
+  const tenant = await prisma.tenant.findUnique({
+    where: { id: Number(tenantId) },
+  });
   if (!tenant) throw new NotFoundError('Tenant not found');
 
   const changes = pick(payload, ['name', 'phone', 'logoUrl', 'websiteUrl', 'address', 'description', 'settings']);
-  if (changes.settings) changes.settings = { ...(tenant.settings || {}), ...changes.settings };
-  await tenant.update(changes);
-  return tenant;
+  if (changes.settings) {
+    changes.settings = { ...(tenant.settings || {}), ...changes.settings };
+  }
+
+  const updated = await prisma.tenant.update({
+    where: { id: Number(tenantId) },
+    data: changes,
+  });
+  return updated;
 }
 
 /* ----------------------------- Members ----------------------------- */
 
 export async function listMembers(tenantId) {
-  return TenantMember.findAll({
-    where: { tenantId },
-    include: [{ model: User, as: 'user', attributes: ['id', 'name', 'email', 'phone', 'isActive', 'lastLoginAt'] }],
-    order: [['createdAt', 'ASC']],
+  return prisma.tenantMember.findMany({
+    where: { tenantId: Number(tenantId) },
+    include: {
+      user: {
+        select: { id: true, name: true, email: true, phone: true, isActive: true, lastLoginAt: true },
+      },
+    },
+    orderBy: { createdAt: 'asc' },
   });
 }
 
 export async function addMember(tenantId, payload, invitedBy, req) {
   const email = normaliseEmail(payload.email);
 
-  let user = await User.findOne({ where: { email } });
+  let user = await prisma.user.findUnique({ where: { email } });
   if (!user) {
-    // A random unusable hash is stored — the member resets their password to sign in.
     const passwordHash = await bcrypt.hash(payload.password || `${Math.random().toString(36).slice(2)}Aa1!`, 12);
-    user = await User.create({ name: payload.name, email, phone: payload.phone || null, passwordHash });
+    user = await prisma.user.create({
+      data: { name: payload.name, email, phone: payload.phone || null, passwordHash },
+    });
   }
 
-  const existing = await TenantMember.findOne({ where: { userId: user.id, tenantId } });
+  const existing = await prisma.tenantMember.findUnique({
+    where: {
+      userId_tenantId: {
+        userId: user.id,
+        tenantId: Number(tenantId),
+      },
+    },
+  });
   if (existing) throw new ConflictError('This user is already a member of your organization');
 
-  const member = await TenantMember.create({
-    userId: user.id,
-    tenantId,
-    role: payload.role,
-    assignedEvents: payload.assignedEvents || null,
-    isActive: true,
-    invitedBy,
+  const member = await prisma.tenantMember.create({
+    data: {
+      userId: user.id,
+      tenantId: Number(tenantId),
+      role: payload.role,
+      assignedEvents: payload.assignedEvents || null,
+      isActive: true,
+      invitedBy: invitedBy ? Number(invitedBy) : null,
+    },
+    include: {
+      user: {
+        select: { id: true, name: true, email: true, phone: true, isActive: true, lastLoginAt: true },
+      },
+    },
   });
 
   await recordAudit({
-    tenantId,
+    tenantId: Number(tenantId),
     userId: invitedBy,
     action: AUDIT_ACTIONS.MEMBER_ADDED,
     entityType: 'tenant_member',
@@ -88,13 +99,23 @@ export async function addMember(tenantId, payload, invitedBy, req) {
 }
 
 export async function updateMember(tenantId, memberId, payload, actorId, req) {
-  const member = await TenantMember.findOne({ where: { id: memberId, tenantId } });
+  const member = await prisma.tenantMember.findFirst({
+    where: { id: Number(memberId), tenantId: Number(tenantId) },
+  });
   if (!member) throw new NotFoundError('Member not found');
 
-  await member.update(pick(payload, ['role', 'assignedEvents', 'isActive']));
+  const updated = await prisma.tenantMember.update({
+    where: { id: member.id },
+    data: pick(payload, ['role', 'assignedEvents', 'isActive']),
+    include: {
+      user: {
+        select: { id: true, name: true, email: true, phone: true, isActive: true, lastLoginAt: true },
+      },
+    },
+  });
 
   await recordAudit({
-    tenantId,
+    tenantId: Number(tenantId),
     userId: actorId,
     action: AUDIT_ACTIONS.MEMBER_UPDATED,
     entityType: 'tenant_member',
@@ -103,19 +124,22 @@ export async function updateMember(tenantId, memberId, payload, actorId, req) {
     req,
   });
 
-  return member;
+  return updated;
 }
 
 export async function removeMember(tenantId, memberId, actorId, req) {
-  const member = await TenantMember.findOne({ where: { id: memberId, tenantId }, include: [{ model: User, as: 'user' }] });
+  const member = await prisma.tenantMember.findFirst({
+    where: { id: Number(memberId), tenantId: Number(tenantId) },
+    include: { user: true },
+  });
   if (!member) throw new NotFoundError('Member not found');
   if (member.userId === actorId) throw new ForbiddenError('You cannot remove yourself');
   if (member.role === 'TENANT_OWNER') throw new ForbiddenError('The organization owner cannot be removed');
 
-  await member.destroy();
+  await prisma.tenantMember.delete({ where: { id: member.id } });
 
   await recordAudit({
-    tenantId,
+    tenantId: Number(tenantId),
     userId: actorId,
     action: AUDIT_ACTIONS.MEMBER_REMOVED,
     entityType: 'tenant_member',
@@ -130,6 +154,7 @@ export async function removeMember(tenantId, memberId, actorId, req) {
 /* --------------------------- Dashboard ----------------------------- */
 
 export async function getDashboardStats(tenantId) {
+  const tId = Number(tenantId);
   const [
     totalEvents,
     liveEvents,
@@ -139,33 +164,32 @@ export async function getDashboardStats(tenantId) {
     revenueRow,
     recentRegistrations,
   ] = await Promise.all([
-    Event.count({ where: { tenantId } }),
-    Event.count({ where: { tenantId, status: 'LIVE' } }),
-    Registration.count({ where: { tenantId, status: 'CONFIRMED' } }),
-    Ticket.count({ where: { tenantId } }),
-    Checkin.count({ where: { tenantId } }),
-    Payment.findOne({
-      where: { tenantId, status: 'CAPTURED' },
-      attributes: [[fn('COALESCE', fn('SUM', col('amount')), 0), 'total']],
-      raw: true,
+    prisma.event.count({ where: { tenantId: tId } }),
+    prisma.event.count({ where: { tenantId: tId, status: 'LIVE' } }),
+    prisma.registration.count({ where: { tenantId: tId, status: 'CONFIRMED' } }),
+    prisma.ticket.count({ where: { tenantId: tId } }),
+    prisma.checkin.count({ where: { tenantId: tId } }),
+    prisma.payment.aggregate({
+      _sum: { amount: true },
+      where: { tenantId: tId, status: 'CAPTURED' },
     }),
-    Registration.findAll({
-      where: { tenantId },
-      include: [
-        { model: Event, as: 'event', attributes: ['id', 'title'] },
-        { model: Customer, as: 'customer', attributes: ['id', 'name', 'email'] },
-        { model: TicketType, as: 'ticketType', attributes: ['id', 'name'] },
-      ],
-      order: [['createdAt', 'DESC']],
-      limit: 5,
+    prisma.registration.findMany({
+      where: { tenantId: tId },
+      include: {
+        event: { select: { id: true, title: true } },
+        customer: { select: { id: true, name: true, email: true } },
+        ticketType: { select: { id: true, name: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 5,
     }),
   ]);
 
-  const upcomingEvents = await Event.findAll({
-    where: { tenantId, status: { [Op.in]: ['LIVE', 'DRAFT'] } },
-    order: [['eventDate', 'ASC']],
-    limit: 5,
-    attributes: ['id', 'title', 'slug', 'eventDate', 'status', 'maxCapacity'],
+  const upcomingEvents = await prisma.event.findMany({
+    where: { tenantId: tId, status: { in: ['LIVE', 'DRAFT'] } },
+    orderBy: { eventDate: 'asc' },
+    take: 5,
+    select: { id: true, title: true, slug: true, eventDate: true, status: true, maxCapacity: true },
   });
 
   return {
@@ -174,38 +198,43 @@ export async function getDashboardStats(tenantId) {
     totalRegistrations,
     ticketsSold,
     checkedIn,
-    revenue: Number(revenueRow?.total || 0),
+    revenue: Number(revenueRow?._sum?.amount || 0),
     recentRegistrations,
     upcomingEvents,
   };
 }
 
 export async function getAnalytics(tenantId) {
+  const tId = Number(tenantId);
   const [payments, ticketTypeBreakdown, registrations] = await Promise.all([
-    Payment.findAll({
-      where: { tenantId, status: 'CAPTURED' },
-      attributes: ['id', 'amount'],
-      include: [
-        {
-          model: Order,
-          as: 'order',
-          attributes: ['id'],
-          include: [
-            {
-              model: Registration,
-              as: 'registration',
-              attributes: ['id'],
-              include: [{ model: Event, as: 'event', attributes: ['id', 'title'] }],
+    prisma.payment.findMany({
+      where: { tenantId: tId, status: 'CAPTURED' },
+      select: {
+        id: true,
+        amount: true,
+        order: {
+          select: {
+            id: true,
+            registration: {
+              select: {
+                id: true,
+                event: { select: { id: true, title: true } },
+              },
             },
-          ],
+          },
         },
-      ],
+      },
     }),
-    TicketType.findAll({ where: { tenantId }, attributes: ['id', 'name', 'quantity', 'soldCount'], raw: true }),
-    Registration.findAll({ where: { tenantId, status: 'CONFIRMED' }, attributes: ['id', 'createdAt'], raw: true }),
+    prisma.ticketType.findMany({
+      where: { tenantId: tId },
+      select: { id: true, name: true, quantity: true, soldCount: true },
+    }),
+    prisma.registration.findMany({
+      where: { tenantId: tId, status: 'CONFIRMED' },
+      select: { id: true, createdAt: true },
+    }),
   ]);
 
-  // Aggregate in JS — simpler and safer than nested SQL grouping for MVP volumes.
   const revenueMap = new Map();
   payments.forEach((payment) => {
     const event = payment.order?.registration?.event;
@@ -234,173 +263,261 @@ export async function getAnalytics(tenantId) {
 
 export async function listRegistrations(tenantId, query) {
   const { page, limit, offset } = parsePagination(query);
-  const where = scopedWhere(tenantId);
+  const where = { tenantId: Number(tenantId) };
   if (query.status) where.status = query.status;
   if (query.eventId) where.eventId = Number(query.eventId);
 
-  const include = [
-    { model: Event, as: 'event', attributes: ['id', 'title', 'slug'] },
-    { model: Customer, as: 'customer', attributes: ['id', 'name', 'email', 'phone'] },
-    { model: TicketType, as: 'ticketType', attributes: ['id', 'name', 'price'] },
-    { model: Order, as: 'order', attributes: ['id', 'orderRef', 'amount', 'currency', 'status'] },
-  ];
-
   if (query.search) {
-    include[1].where = {
-      [Op.or]: [
-        { name: { [Op.like]: `%${query.search}%` } },
-        { email: { [Op.like]: `%${query.search}%` } },
+    where.customer = {
+      OR: [
+        { name: { contains: query.search } },
+        { email: { contains: query.search } },
       ],
     };
-    include[1].required = true;
   }
 
   const SORTABLE = ['createdAt', 'updatedAt', 'status', 'quantity'];
   const sortBy = SORTABLE.includes(query.sortBy) ? query.sortBy : 'createdAt';
-  const sortOrder = String(query.order || 'DESC').toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+  const sortOrder = String(query.order || 'DESC').toUpperCase() === 'ASC' ? 'asc' : 'desc';
 
-  const { rows, count } = await Registration.findAndCountAll({
-    where,
-    include,
-    order: [[sortBy, sortOrder]],
-    limit,
-    offset,
-    distinct: true,
-  });
+  const [count, rows] = await Promise.all([
+    prisma.registration.count({ where }),
+    prisma.registration.findMany({
+      where,
+      skip: offset,
+      take: limit,
+      orderBy: { [sortBy]: sortOrder },
+      include: {
+        event: { select: { id: true, title: true, slug: true } },
+        customer: { select: { id: true, name: true, email: true, phone: true } },
+        ticketType: { select: { id: true, name: true, price: true } },
+        orders: { select: { id: true, orderRef: true, amount: true, currency: true, status: true } },
+      },
+    }),
+  ]);
 
-  return { rows, pagination: buildPagination(count, page, limit) };
+  const mappedRows = rows.map((r) => ({
+    ...r,
+    order: r.orders?.[0] || null,
+  }));
+
+  return { rows: mappedRows, pagination: buildPagination(count, page, limit) };
 }
 
 export async function getRegistration(tenantId, id) {
-  const registration = await Registration.findOne({
-    where: { id, tenantId },
-    include: [
-      { model: Event, as: 'event' },
-      { model: Customer, as: 'customer' },
-      { model: TicketType, as: 'ticketType' },
-      { model: Order, as: 'order', include: [{ model: Payment, as: 'payment' }, { model: Ticket, as: 'tickets' }] },
-      {
-        model: RegistrationData,
-        as: 'formData',
-        include: [{ model: RegistrationForm, as: 'formField', attributes: ['id', 'fieldName', 'fieldLabel'] }],
+  const registration = await prisma.registration.findFirst({
+    where: { id: Number(id), tenantId: Number(tenantId) },
+    include: {
+      event: true,
+      customer: true,
+      ticketType: true,
+      orders: {
+        include: {
+          payments: true,
+          tickets: true,
+        },
       },
-    ],
+      registrationData: {
+        include: {
+          formField: { select: { id: true, fieldName: true, fieldLabel: true } },
+        },
+      },
+    },
   });
   if (!registration) throw new NotFoundError('Registration not found');
-  return registration;
+
+  return {
+    ...registration,
+    order: registration.orders?.[0] || null,
+    formData: registration.registrationData,
+  };
 }
 
 export async function listOrders(tenantId, query) {
   const { page, limit, offset } = parsePagination(query);
-  const where = scopedWhere(tenantId);
+  const where = { tenantId: Number(tenantId) };
   if (query.status) where.status = query.status;
 
-  const { rows, count } = await Order.findAndCountAll({
-    where,
-    include: [
-      { model: Customer, as: 'customer', attributes: ['id', 'name', 'email'] },
-      { model: Payment, as: 'payment', attributes: ['id', 'status', 'method', 'razorpayPaymentId'] },
-      { model: Registration, as: 'registration', attributes: ['id', 'registrationRef', 'eventId'] },
-    ],
-    order: [['createdAt', 'DESC']],
-    limit,
-    offset,
-    distinct: true,
-  });
+  const [count, rows] = await Promise.all([
+    prisma.order.count({ where }),
+    prisma.order.findMany({
+      where,
+      skip: offset,
+      take: limit,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        customer: { select: { id: true, name: true, email: true } },
+        payments: { select: { id: true, status: true, method: true, razorpayPaymentId: true } },
+        registration: { select: { id: true, registrationRef: true, eventId: true } },
+      },
+    }),
+  ]);
 
-  return { rows, pagination: buildPagination(count, page, limit) };
+  const mappedRows = rows.map((o) => ({
+    ...o,
+    payment: o.payments?.[0] || null,
+  }));
+
+  return { rows: mappedRows, pagination: buildPagination(count, page, limit) };
 }
 
 export async function listPayments(tenantId, query) {
   const { page, limit, offset } = parsePagination(query);
-  const where = scopedWhere(tenantId);
+  const where = { tenantId: Number(tenantId) };
   if (query.status) where.status = query.status;
 
-  const { rows, count } = await Payment.findAndCountAll({
-    where,
-    include: [{ model: Order, as: 'order', attributes: ['id', 'orderRef', 'status'], include: [{ model: Customer, as: 'customer', attributes: ['id', 'name', 'email'] }] }],
-    order: [['createdAt', 'DESC']],
-    limit,
-    offset,
-    distinct: true,
-  });
+  const [count, rows] = await Promise.all([
+    prisma.payment.count({ where }),
+    prisma.payment.findMany({
+      where,
+      skip: offset,
+      take: limit,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        order: {
+          select: { id: true, orderRef: true, status: true },
+          include: { customer: { select: { id: true, name: true, email: true } } },
+        },
+      },
+    }),
+  ]);
 
   return { rows, pagination: buildPagination(count, page, limit) };
 }
 
 export async function listTickets(tenantId, query) {
   const { page, limit, offset } = parsePagination(query);
-  const where = scopedWhere(tenantId);
+  const where = { tenantId: Number(tenantId) };
   if (query.status) where.status = query.status;
   if (query.eventId) where.eventId = Number(query.eventId);
 
-  const { rows, count } = await Ticket.findAndCountAll({
-    where,
-    attributes: { exclude: ['verificationToken', 'qrData'] },
-    include: [
-      { model: Event, as: 'event', attributes: ['id', 'title'] },
-      { model: Customer, as: 'customer', attributes: ['id', 'name', 'email'] },
-      { model: TicketType, as: 'ticketType', attributes: ['id', 'name'] },
-      { model: Checkin, as: 'checkin', attributes: ['id', 'checkedInAt', 'gateName'] },
-    ],
-    order: [['createdAt', 'DESC']],
-    limit,
-    offset,
-    distinct: true,
-  });
+  const [count, rows] = await Promise.all([
+    prisma.ticket.count({ where }),
+    prisma.ticket.findMany({
+      where,
+      skip: offset,
+      take: limit,
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        ticketKey: true,
+        tenantId: true,
+        eventId: true,
+        activityId: true,
+        orderId: true,
+        registrationId: true,
+        customerId: true,
+        ticketTypeId: true,
+        status: true,
+        pdfUrl: true,
+        createdAt: true,
+        updatedAt: true,
+        event: { select: { id: true, title: true } },
+        customer: { select: { id: true, name: true, email: true } },
+        ticketType: { select: { id: true, name: true } },
+        checkins: { select: { id: true, checkedInAt: true, gateName: true } },
+      },
+    }),
+  ]);
 
-  return { rows, pagination: buildPagination(count, page, limit) };
+  const mappedRows = rows.map((t) => ({
+    ...t,
+    checkin: t.checkins?.[0] || null,
+  }));
+
+  return { rows: mappedRows, pagination: buildPagination(count, page, limit) };
 }
 
 export async function getTicket(tenantId, id) {
-  const ticket = await Ticket.findOne({
-    where: { id, tenantId },
-    include: [
-      { model: Event, as: 'event' },
-      { model: Customer, as: 'customer' },
-      { model: TicketType, as: 'ticketType' },
-      { model: Checkin, as: 'checkin' },
-    ],
+  const ticket = await prisma.ticket.findFirst({
+    where: { id: Number(id), tenantId: Number(tenantId) },
+    include: {
+      event: true,
+      customer: true,
+      ticketType: true,
+      checkins: true,
+    },
   });
   if (!ticket) throw new NotFoundError('Ticket not found');
-  return ticket;
+
+  return {
+    ...ticket,
+    checkin: ticket.checkins?.[0] || null,
+  };
 }
 
 export async function listCheckins(tenantId, query) {
   const { page, limit, offset } = parsePagination(query);
-  const where = scopedWhere(tenantId);
+  const where = { tenantId: Number(tenantId) };
   if (query.eventId) where.eventId = Number(query.eventId);
 
-  const { rows, count } = await Checkin.findAndCountAll({
-    where,
-    include: [
-      { model: Event, as: 'event', attributes: ['id', 'title'] },
-      { model: User, as: 'staff', attributes: ['id', 'name'] },
-      { model: Ticket, as: 'ticket', attributes: ['id', 'ticketKey'], include: [{ model: Customer, as: 'customer', attributes: ['id', 'name', 'email'] }] },
-    ],
-    order: [['createdAt', 'DESC']],
-    limit,
-    offset,
-    distinct: true,
-  });
+  const [count, rows] = await Promise.all([
+    prisma.checkin.count({ where }),
+    prisma.checkin.findMany({
+      where,
+      skip: offset,
+      take: limit,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        event: { select: { id: true, title: true } },
+        scanner: { select: { id: true, name: true } },
+        ticket: {
+          select: {
+            id: true,
+            ticketKey: true,
+            customer: { select: { id: true, name: true, email: true } },
+          },
+        },
+      },
+    }),
+  ]);
 
-  return { rows, pagination: buildPagination(count, page, limit) };
+  const mappedRows = rows.map((c) => ({
+    ...c,
+    staff: c.scanner,
+  }));
+
+  return { rows: mappedRows, pagination: buildPagination(count, page, limit) };
 }
 
 export async function listAuditLogs(tenantId, query) {
   const { page, limit, offset } = parsePagination(query);
-  const where = scopedWhere(tenantId);
-  if (query.search) where.action = { [Op.like]: `%${query.search}%` };
+  const where = { tenantId: Number(tenantId) };
+  if (query.search) {
+    where.action = { contains: query.search };
+  }
 
-  const { rows, count } = await AuditLog.findAndCountAll({
-    where,
-    include: [{ model: User, as: 'user', attributes: ['id', 'name', 'email'] }],
-    order: [['createdAt', 'DESC']],
-    limit,
-    offset,
-    distinct: true,
-  });
+  const [count, rows] = await Promise.all([
+    prisma.auditLog.count({ where }),
+    prisma.auditLog.findMany({
+      where,
+      skip: offset,
+      take: limit,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        user: { select: { id: true, name: true, email: true } },
+      },
+    }),
+  ]);
 
   return { rows, pagination: buildPagination(count, page, limit) };
 }
 
+export default {
+  getProfile,
+  updateProfile,
+  listMembers,
+  addMember,
+  updateMember,
+  removeMember,
+  getDashboardStats,
+  getAnalytics,
+  listRegistrations,
+  getRegistration,
+  listOrders,
+  listPayments,
+  listTickets,
+  getTicket,
+  listCheckins,
+  listAuditLogs,
+};

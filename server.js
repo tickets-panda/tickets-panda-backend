@@ -1,15 +1,15 @@
 import app from './src/app.js';
 import { env } from './src/config/env.js';
 import { logger } from './src/utils/logger.js';
-import { connectDatabase, sequelize } from './src/config/database.js';
-import './src/database/models/index.js';
+import prisma from './src/lib/prisma.js';
 import { startOrderExpiryJob, stopOrderExpiryJob } from './src/jobs/orderExpiry.job.js';
 
 let server;
 
 async function start() {
   try {
-    await connectDatabase();
+    await prisma.$connect();
+    logger.info(`Prisma connected to database (${env.db.host}:${env.db.port}/${env.db.name})`);
 
     startOrderExpiryJob();
 
@@ -29,7 +29,7 @@ async function shutdown(signal) {
   if (server) {
     await new Promise((resolve) => server.close(resolve));
   }
-  await sequelize.close().catch(() => {});
+  await prisma.$disconnect().catch(() => {});
   process.exit(0);
 }
 

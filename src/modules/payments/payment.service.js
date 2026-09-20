@@ -1,8 +1,7 @@
 import { env } from '../../config/env.js';
 import { localTestPaymentProvider } from './providers/localTestPayment.provider.js';
 import { razorpayPaymentProvider } from './providers/razorpayPayment.provider.js';
-import { Payment, Order, Registration, Customer, TicketType } from '../../database/models/index.js';
-import { NotFoundError, ConflictError, AppError } from '../../utils/errors.js';
+import { AppError } from '../../utils/errors.js';
 import { logger } from '../../utils/logger.js';
 
 /**

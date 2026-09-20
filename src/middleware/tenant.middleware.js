@@ -1,4 +1,4 @@
-import { Tenant, TenantMember } from '../database/models/index.js';
+import prisma from '../lib/prisma.js';
 import { ForbiddenError, UnauthorizedError } from '../utils/errors.js';
 import { catchAsync } from '../utils/helpers.js';
 import { isEventScopedRole } from './role.middleware.js';
@@ -10,14 +10,16 @@ import { isEventScopedRole } from './role.middleware.js';
 export const attachTenant = catchAsync(async (req, res, next) => {
   if (!req.user?.tenantId) throw new ForbiddenError('No tenant context for this user');
 
-  const tenant = await Tenant.findByPk(req.user.tenantId);
+  const tenant = await prisma.tenant.findUnique({
+    where: { id: Number(req.user.tenantId) },
+  });
   if (!tenant) throw new UnauthorizedError('Tenant no longer exists');
   if (['SUSPENDED', 'INACTIVE'].includes(tenant.status)) {
     throw new ForbiddenError('This tenant account is not active');
   }
 
-  const membership = await TenantMember.findOne({
-    where: { userId: req.user.id, tenantId: tenant.id, isActive: true },
+  const membership = await prisma.tenantMember.findFirst({
+    where: { userId: Number(req.user.id), tenantId: tenant.id, isActive: true },
   });
   if (!membership) throw new ForbiddenError('You are not an active member of this tenant');
 

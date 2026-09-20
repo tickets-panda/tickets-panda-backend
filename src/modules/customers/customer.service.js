@@ -1,5 +1,4 @@
-import { Op } from 'sequelize';
-import { Customer, OtpVerification, Ticket, Event, TicketType, Checkin } from '../../database/models/index.js';
+import prisma from '../../lib/prisma.js';
 import { NotFoundError, ValidationError, ForbiddenError } from '../../utils/errors.js';
 import { normaliseEmail, normalisePhone } from '../../utils/helpers.js';
 import { generateOtp } from '../../utils/generators.js';
@@ -13,7 +12,9 @@ import { logger } from '../../utils/logger.js';
 const normalise = (identifier, type) => (type === 'PHONE' ? normalisePhone(identifier) : normaliseEmail(identifier));
 
 const findCustomer = async (identifier, type) =>
-  type === 'PHONE' ? Customer.findOne({ where: { phone: identifier } }) : Customer.findOne({ where: { email: identifier } });
+  type === 'PHONE'
+    ? prisma.customer.findFirst({ where: { phone: identifier } })
+    : prisma.customer.findFirst({ where: { email: identifier } });
 
 /** Issues a one-time code for "My Tickets" access. */
 export async function sendOtp({ identifier, type = 'EMAIL' }, req) {
@@ -21,12 +22,14 @@ export async function sendOtp({ identifier, type = 'EMAIL' }, req) {
   if (!value) throw new ValidationError(`A valid ${type === 'PHONE' ? 'phone number' : 'email address'} is required`);
 
   const otp = generateOtp(env.otp.length);
-  await OtpVerification.create({
-    identifier: value,
-    identifierType: type,
-    otp,
-    purpose: 'CUSTOMER_LOGIN',
-    expiresAt: new Date(Date.now() + env.otp.expiryMinutes * 60 * 1000),
+  await prisma.otpVerification.create({
+    data: {
+      identifier: value,
+      identifierType: type,
+      otp,
+      purpose: 'CUSTOMER_LOGIN',
+      expiresAt: new Date(Date.now() + env.otp.expiryMinutes * 60 * 1000),
+    },
   });
 
   if (type === 'EMAIL') {
@@ -38,7 +41,6 @@ export async function sendOtp({ identifier, type = 'EMAIL' }, req) {
       data: { otp, expiryMinutes: env.otp.expiryMinutes },
     });
   } else {
-    // SMS provider is out of MVP scope — the code is logged for local testing.
     logger.info(`[otp:sms-not-configured] ${value} → ${otp}`);
   }
 
@@ -57,14 +59,14 @@ export async function verifyOtp({ identifier, type = 'EMAIL', otp }, req) {
   const value = normalise(identifier, type);
   if (!value) throw new ValidationError('A valid email or phone is required');
 
-  const record = await OtpVerification.findOne({
+  const record = await prisma.otpVerification.findFirst({
     where: {
       identifier: value,
       purpose: 'CUSTOMER_LOGIN',
       isUsed: false,
-      expiresAt: { [Op.gt]: new Date() },
+      expiresAt: { gt: new Date() },
     },
-    order: [['createdAt', 'DESC']],
+    orderBy: { createdAt: 'desc' },
   });
 
   if (!record) throw new ValidationError('This code is invalid or has expired');
@@ -73,15 +75,26 @@ export async function verifyOtp({ identifier, type = 'EMAIL', otp }, req) {
   }
 
   if (record.otp !== String(otp)) {
-    await record.increment('attempts');
+    await prisma.otpVerification.update({
+      where: { id: record.id },
+      data: { attempts: { increment: 1 } },
+    });
     throw new ValidationError('Incorrect code');
   }
 
-  await record.update({ isUsed: true });
+  await prisma.otpVerification.update({
+    where: { id: record.id },
+    data: { isUsed: true },
+  });
 
   const customer = await findCustomer(value, type);
   if (!customer) throw new NotFoundError('We could not find any bookings for those details');
-  if (!customer.isVerified) await customer.update({ isVerified: true });
+  if (!customer.isVerified) {
+    await prisma.customer.update({
+      where: { id: customer.id },
+      data: { isVerified: true },
+    });
+  }
 
   const accessToken = signCustomerToken(customer);
 
@@ -93,40 +106,48 @@ export async function verifyOtp({ identifier, type = 'EMAIL', otp }, req) {
 
 /** Returns every ticket belonging to a customer, grouped for display. */
 export async function myTickets(customerId) {
-  const tickets = await Ticket.findAll({
-    where: { customerId },
-    include: [
-      { model: Event, as: 'event', attributes: ['id', 'title', 'slug', 'eventDate', 'eventTimeStart', 'venueName', 'venueAddress', 'bannerUrl'] },
-      { model: TicketType, as: 'ticketType', attributes: ['id', 'name', 'price'] },
-      { model: Checkin, as: 'checkin', attributes: ['id', 'checkedInAt', 'gateName'] },
-    ],
-    order: [['createdAt', 'DESC']],
+  const tickets = await prisma.ticket.findMany({
+    where: { customerId: Number(customerId) },
+    include: {
+      event: {
+        select: {
+          id: true,
+          title: true,
+          slug: true,
+          eventDate: true,
+          eventTimeStart: true,
+          venueName: true,
+          venueAddress: true,
+          bannerUrl: true,
+        },
+      },
+      ticketType: { select: { id: true, name: true, price: true } },
+      checkins: { select: { id: true, checkedInAt: true, gateName: true } },
+    },
+    orderBy: { createdAt: 'desc' },
   });
 
-  return tickets.map((ticket) => {
-    const plain = ticket.toJSON();
-    return {
-      id: plain.id,
-      ticketKey: plain.ticketKey,
-      status: plain.status,
-      qrData: plain.qrData,
-      event: plain.event,
-      ticketType: plain.ticketType,
-      checkedInAt: plain.checkin?.checkedInAt || null,
-    };
-  });
+  return tickets.map((plain) => ({
+    id: plain.id,
+    ticketKey: plain.ticketKey,
+    status: plain.status,
+    qrData: plain.qrData,
+    event: plain.event,
+    ticketType: plain.ticketType,
+    checkedInAt: plain.checkins?.[0]?.checkedInAt || null,
+  }));
 }
 
 /** Resolves an opaque verification token to a safe, public ticket summary. */
 export async function resolveVerificationToken(token) {
-  const ticket = await Ticket.findOne({
+  const ticket = await prisma.ticket.findUnique({
     where: { verificationToken: token },
-    include: [
-      { model: Event, as: 'event', attributes: ['id', 'title', 'eventDate', 'eventTimeStart', 'venueName'] },
-      { model: TicketType, as: 'ticketType', attributes: ['id', 'name'] },
-      { model: Customer, as: 'customer', attributes: ['id', 'name'] },
-      { model: Checkin, as: 'checkin', attributes: ['id', 'checkedInAt', 'gateName'] },
-    ],
+    include: {
+      event: { select: { id: true, title: true, eventDate: true, eventTimeStart: true, venueName: true } },
+      ticketType: { select: { id: true, name: true } },
+      customer: { select: { id: true, name: true } },
+      checkins: { select: { id: true, checkedInAt: true, gateName: true } },
+    },
   });
 
   if (!ticket) throw new NotFoundError('Ticket not found');
@@ -137,7 +158,7 @@ export async function resolveVerificationToken(token) {
     holder: ticket.customer?.name || null,
     event: ticket.event,
     ticketType: ticket.ticketType,
-    checkedInAt: ticket.checkin?.checkedInAt || null,
+    checkedInAt: ticket.checkins?.[0]?.checkedInAt || null,
   };
 }
 

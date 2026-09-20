@@ -1,0 +1,581 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id             Int            @id @default(autoincrement())
+  name           String         @db.VarChar(150)
+  email          String         @unique @db.VarChar(150)
+  passwordHash   String         @map("password_hash") @db.VarChar(255)
+  phone          String?        @db.VarChar(20)
+  avatarUrl      String?        @map("avatar_url") @db.VarChar(500)
+  role           PlatformRole?
+  isActive       Boolean        @default(true) @map("is_active")
+  lastLoginAt    DateTime?      @map("last_login_at")
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+  auditLogs      AuditLog[]
+  checkins       Checkin[]
+  createdEvents  Event[]        @relation("EventCreatedBy")
+  invitedMembers TenantMember[] @relation("MemberInviter")
+  tenantMembers  TenantMember[] @relation("UserMemberships")
+
+  @@index([role])
+  @@index([isActive])
+  @@map("users")
+}
+
+model Tenant {
+  id                Int                @id @default(autoincrement())
+  name              String             @db.VarChar(150)
+  slug              String             @unique @db.VarChar(100)
+  email             String             @unique @db.VarChar(150)
+  phone             String?            @db.VarChar(20)
+  logoUrl           String?            @map("logo_url") @db.VarChar(500)
+  websiteUrl        String?            @map("website_url") @db.VarChar(255)
+  address           String?            @db.Text
+  description       String?            @db.Text
+  category          String?            @db.VarChar(100)
+  coverImageUrl     String?            @map("cover_image_url") @db.VarChar(500)
+  socialLinks       Json?              @map("social_links")
+  supportEmail      String?            @map("support_email") @db.VarChar(150)
+  supportPhone      String?            @map("support_phone") @db.VarChar(20)
+  brandingJson      Json?              @map("branding_json")
+  status            TenantStatus       @default(PENDING_VERIFICATION)
+  subscriptionPlan  SubscriptionPlan   @default(FREE) @map("subscription_plan")
+  settings          Json?
+  createdAt         DateTime           @default(now()) @map("created_at")
+  updatedAt         DateTime           @updatedAt @map("updated_at")
+  activities        Activity[]
+  auditLogs         AuditLog[]
+  checkins          Checkin[]
+  emailLogs         EmailLog[]
+  events            Event[]
+  orders            Order[]
+  payments          Payment[]
+  registrationForms RegistrationForm[]
+  registrations     Registration[]
+  members           TenantMember[]
+  ticketTypes       TicketType[]
+  tickets           Ticket[]
+
+  @@index([status])
+  @@map("tenants")
+}
+
+model TenantMember {
+  id             Int        @id @default(autoincrement())
+  userId         Int        @map("user_id")
+  tenantId       Int        @map("tenant_id")
+  role           TenantRole
+  assignedEvents Json?      @map("assigned_events")
+  isActive       Boolean    @default(true) @map("is_active")
+  invitedBy      Int?       @map("invited_by")
+  createdAt      DateTime   @default(now()) @map("created_at")
+  updatedAt      DateTime   @updatedAt @map("updated_at")
+  inviter        User?      @relation("MemberInviter", fields: [invitedBy], references: [id])
+  tenant         Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user           User       @relation("UserMemberships", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, tenantId])
+  @@index([tenantId, role])
+  @@index([userId])
+  @@index([invitedBy], map: "tenant_members_invited_by_fkey")
+  @@map("tenant_members")
+}
+
+model Customer {
+  id            Int            @id @default(autoincrement())
+  name          String         @db.VarChar(150)
+  email         String         @db.VarChar(150)
+  phone         String?        @db.VarChar(20)
+  isVerified    Boolean        @default(false) @map("is_verified")
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+  orders        Order[]
+  registrations Registration[]
+  tickets       Ticket[]
+
+  @@index([email])
+  @@index([phone])
+  @@map("customers")
+}
+
+model Event {
+  id                   Int                @id @default(autoincrement())
+  tenantId             Int                @map("tenant_id")
+  title                String             @db.VarChar(200)
+  slug                 String             @db.VarChar(200)
+  shortDescription     String?            @map("short_description") @db.VarChar(500)
+  description          String?            @db.Text
+  bannerUrl            String?            @map("banner_url") @db.VarChar(500)
+  venueName            String             @map("venue_name") @db.VarChar(200)
+  venueAddress         String?            @map("venue_address") @db.Text
+  venueMapUrl          String?            @map("venue_map_url") @db.VarChar(500)
+  startAt              DateTime?          @map("start_at")
+  endAt                DateTime?          @map("end_at")
+  eventDate            DateTime           @map("event_date") @db.Date
+  eventTimeStart       String             @map("event_time_start") @db.VarChar(20)
+  eventTimeEnd         String?            @map("event_time_end") @db.VarChar(20)
+  maxCapacity          Int?               @map("max_capacity")
+  registrationOpenAt   DateTime?          @map("registration_open_at")
+  registrationCloseAt  DateTime?          @map("registration_close_at")
+  registrationDeadline DateTime?          @map("registration_deadline")
+  rules                String?            @db.Text
+  faqJson              Json?              @map("faq_json")
+  contactJson          Json?              @map("contact_json")
+  galleryUrls          Json?              @map("gallery_urls")
+  status               EventStatus        @default(DRAFT)
+  settings             Json?
+  createdBy            Int?               @map("created_by")
+  createdAt            DateTime           @default(now()) @map("created_at")
+  updatedAt            DateTime           @updatedAt @map("updated_at")
+  activities           Activity[]
+  checkins             Checkin[]
+  creator              User?              @relation("EventCreatedBy", fields: [createdBy], references: [id])
+  tenant               Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  registrationForms    RegistrationForm[]
+  registrations        Registration[]
+  ticketTypes          TicketType[]
+  tickets              Ticket[]
+
+  @@unique([tenantId, slug])
+  @@index([tenantId, status])
+  @@index([tenantId, eventDate])
+  @@index([createdBy], map: "events_created_by_fkey")
+  @@map("events")
+}
+
+model Activity {
+  id               Int                @id @default(autoincrement())
+  tenantId         Int                @map("tenant_id")
+  eventId          Int                @map("event_id")
+  slug             String             @db.VarChar(200)
+  title            String             @db.VarChar(200)
+  shortDescription String?            @map("short_description") @db.VarChar(500)
+  description      String?            @db.Text
+  posterUrl        String?            @map("poster_url") @db.VarChar(500)
+  rules            String?            @db.Text
+  eligibility      String?            @db.Text
+  startsAt         DateTime?          @map("starts_at")
+  endsAt           DateTime?          @map("ends_at")
+  venue            String?            @db.VarChar(300)
+  capacity         Int?
+  status           ActivityStatus     @default(DRAFT)
+  sortOrder        Int                @default(0) @map("sort_order")
+  createdAt        DateTime           @default(now()) @map("created_at")
+  updatedAt        DateTime           @updatedAt @map("updated_at")
+  event            Event              @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  tenant           Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  checkins         Checkin[]
+  formFields       RegistrationForm[]
+  registrations    Registration[]
+  ticketTypes      TicketType[]
+  tickets          Ticket[]
+
+  @@unique([eventId, slug])
+  @@index([tenantId])
+  @@index([eventId, status])
+  @@map("activities")
+}
+
+model TicketType {
+  id            Int            @id @default(autoincrement())
+  eventId       Int            @map("event_id")
+  activityId    Int?           @map("activity_id")
+  tenantId      Int            @map("tenant_id")
+  name          String         @db.VarChar(100)
+  description   String?        @db.Text
+  price         Decimal        @default(0.00) @db.Decimal(10, 2)
+  currency      String         @default("INR") @db.VarChar(3)
+  quantity      Int
+  soldCount     Int            @default(0) @map("sold_count")
+  minPerOrder   Int            @default(1) @map("min_per_order")
+  maxPerOrder   Int            @default(10) @map("max_per_order")
+  sortOrder     Int            @default(0) @map("sort_order")
+  isActive      Boolean        @default(true) @map("is_active")
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+  registrations Registration[]
+  activity      Activity?      @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  event         Event          @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tickets       Ticket[]
+
+  @@index([eventId, isActive])
+  @@index([tenantId])
+  @@index([activityId])
+  @@map("ticket_types")
+}
+
+model RegistrationForm {
+  id               Int                @id @default(autoincrement())
+  eventId          Int                @map("event_id")
+  activityId       Int?               @map("activity_id")
+  tenantId         Int                @map("tenant_id")
+  fieldName        String             @map("field_name") @db.VarChar(100)
+  fieldLabel       String             @map("field_label") @db.VarChar(200)
+  helpText         String?            @map("help_text") @db.VarChar(500)
+  fieldType        FormFieldType      @map("field_type")
+  options          Json?
+  isRequired       Boolean            @default(false) @map("is_required")
+  sortOrder        Int                @default(0) @map("sort_order")
+  placeholder      String?            @db.VarChar(200)
+  validationRules  Json?              @map("validation_rules")
+  fileConfig       Json?              @map("file_config")
+  createdAt        DateTime           @default(now()) @map("created_at")
+  updatedAt        DateTime           @updatedAt @map("updated_at")
+  registrationData RegistrationData[]
+  activity         Activity?          @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  event            Event              @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  tenant           Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([eventId, sortOrder])
+  @@index([tenantId])
+  @@index([activityId])
+  @@map("registration_forms")
+}
+
+model Registration {
+  id               Int                @id @default(autoincrement())
+  registrationRef  String             @unique @map("registration_ref") @db.VarChar(50)
+  tenantId         Int                @map("tenant_id")
+  eventId          Int                @map("event_id")
+  activityId       Int?               @map("activity_id")
+  customerId       Int                @map("customer_id")
+  ticketTypeId     Int                @map("ticket_type_id")
+  quantity         Int                @default(1)
+  status           RegistrationStatus @default(PENDING)
+  createdAt        DateTime           @default(now()) @map("created_at")
+  updatedAt        DateTime           @updatedAt @map("updated_at")
+  orders           Order[]
+  registrationData RegistrationData[]
+  activity         Activity?          @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  customer         Customer           @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  event            Event              @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  tenant           Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  ticketType       TicketType         @relation(fields: [ticketTypeId], references: [id])
+  tickets          Ticket[]
+
+  @@index([tenantId, eventId])
+  @@index([customerId])
+  @@index([activityId])
+  @@index([eventId], map: "registrations_event_id_fkey")
+  @@index([ticketTypeId], map: "registrations_ticket_type_id_fkey")
+  @@map("registrations")
+}
+
+model RegistrationData {
+  id             Int              @id @default(autoincrement())
+  registrationId Int              @map("registration_id")
+  formFieldId    Int              @map("form_field_id")
+  fieldValue     String           @map("field_value") @db.Text
+  createdAt      DateTime         @default(now()) @map("created_at")
+  updatedAt      DateTime         @updatedAt @map("updated_at")
+  formField      RegistrationForm @relation(fields: [formFieldId], references: [id], onDelete: Cascade)
+  registration   Registration     @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+
+  @@index([registrationId])
+  @@index([formFieldId])
+  @@map("registration_data")
+}
+
+model Order {
+  id             Int          @id @default(autoincrement())
+  orderRef       String       @unique @map("order_ref") @db.VarChar(50)
+  tenantId       Int          @map("tenant_id")
+  registrationId Int          @map("registration_id")
+  customerId     Int          @map("customer_id")
+  amount         Decimal      @db.Decimal(10, 2)
+  currency       String       @default("INR") @db.VarChar(3)
+  status         OrderStatus  @default(CREATED)
+  createdAt      DateTime     @default(now()) @map("created_at")
+  updatedAt      DateTime     @updatedAt @map("updated_at")
+  customer       Customer     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  registration   Registration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+  tenant         Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  payments       Payment[]
+  tickets        Ticket[]
+
+  @@index([tenantId, status])
+  @@index([registrationId])
+  @@index([customerId])
+  @@map("orders")
+}
+
+model Payment {
+  id                Int           @id @default(autoincrement())
+  orderId           Int           @map("order_id")
+  tenantId          Int           @map("tenant_id")
+  provider          String        @default("LOCAL_TEST") @db.VarChar(50)
+  providerOrderId   String?       @map("provider_order_id") @db.VarChar(100)
+  providerPaymentId String?       @map("provider_payment_id") @db.VarChar(100)
+  providerSignature String?       @map("provider_signature") @db.VarChar(255)
+  razorpayOrderId   String?       @map("razorpay_order_id") @db.VarChar(100)
+  razorpayPaymentId String?       @map("razorpay_payment_id") @db.VarChar(100)
+  razorpaySignature String?       @map("razorpay_signature") @db.VarChar(255)
+  amount            Decimal       @db.Decimal(10, 2)
+  currency          String        @default("INR") @db.VarChar(3)
+  method            String?       @db.VarChar(50)
+  status            PaymentStatus @default(CREATED)
+  capturedAt        DateTime?     @map("captured_at")
+  failedReason      String?       @map("failed_reason") @db.VarChar(255)
+  createdAt         DateTime      @default(now()) @map("created_at")
+  updatedAt         DateTime      @updatedAt @map("updated_at")
+  order             Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  tenant            Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([providerOrderId])
+  @@index([razorpayOrderId])
+  @@index([status])
+  @@index([tenantId])
+  @@map("payments")
+}
+
+model Ticket {
+  id                Int          @id @default(autoincrement())
+  ticketKey         String       @unique @map("ticket_key") @db.VarChar(50)
+  verificationToken String       @unique @map("verification_token") @db.VarChar(255)
+  tenantId          Int          @map("tenant_id")
+  eventId           Int          @map("event_id")
+  activityId        Int?         @map("activity_id")
+  orderId           Int          @map("order_id")
+  registrationId    Int          @map("registration_id")
+  customerId        Int          @map("customer_id")
+  ticketTypeId      Int          @map("ticket_type_id")
+  status            TicketStatus @default(ACTIVE)
+  qrData            String?      @map("qr_data") @db.Text
+  pdfUrl            String?      @map("pdf_url") @db.VarChar(500)
+  createdAt         DateTime     @default(now()) @map("created_at")
+  updatedAt         DateTime     @updatedAt @map("updated_at")
+  checkins          Checkin[]
+  activity          Activity?    @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  customer          Customer     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  event             Event        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  order             Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  registration      Registration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+  tenant            Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  ticketType        TicketType   @relation(fields: [ticketTypeId], references: [id])
+
+  @@index([tenantId, eventId, status])
+  @@index([orderId])
+  @@index([customerId])
+  @@index([activityId])
+  @@index([eventId], map: "tickets_event_id_fkey")
+  @@index([registrationId], map: "tickets_registration_id_fkey")
+  @@index([ticketTypeId], map: "tickets_ticket_type_id_fkey")
+  @@map("tickets")
+}
+
+model Checkin {
+  id          Int       @id @default(autoincrement())
+  ticketId    Int       @map("ticket_id")
+  tenantId    Int       @map("tenant_id")
+  eventId     Int       @map("event_id")
+  activityId  Int?      @map("activity_id")
+  checkedInBy Int?      @map("checked_in_by")
+  gateName    String?   @map("gate_name") @db.VarChar(100)
+  checkedInAt DateTime  @default(now()) @map("checked_in_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  activity    Activity? @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  scanner     User?     @relation(fields: [checkedInBy], references: [id])
+  event       Event     @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  tenant      Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  ticket      Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@index([tenantId, eventId])
+  @@index([checkedInAt])
+  @@index([activityId], map: "checkins_activity_id_fkey")
+  @@index([checkedInBy], map: "checkins_checked_in_by_fkey")
+  @@index([eventId], map: "checkins_event_id_fkey")
+  @@map("checkins")
+}
+
+model OtpVerification {
+  id             Int               @id @default(autoincrement())
+  identifier     String            @db.VarChar(150)
+  identifierType OtpIdentifierType @map("identifier_type")
+  otp            String            @db.VarChar(10)
+  purpose        OtpPurpose
+  isUsed         Boolean           @default(false) @map("is_used")
+  expiresAt      DateTime          @map("expires_at")
+  attempts       Int               @default(0)
+  createdAt      DateTime          @default(now()) @map("created_at")
+  updatedAt      DateTime          @updatedAt @map("updated_at")
+
+  @@index([identifier, purpose, isUsed])
+  @@index([expiresAt])
+  @@map("otp_verifications")
+}
+
+model WebhookEvent {
+  id               Int       @id @default(autoincrement())
+  provider         String    @db.VarChar(50)
+  eventType        String    @map("event_type") @db.VarChar(100)
+  payload          Json
+  processed        Boolean   @default(false)
+  processingResult String?   @map("processing_result") @db.Text
+  receivedAt       DateTime  @default(now()) @map("received_at")
+  processedAt      DateTime? @map("processed_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  @@index([provider, eventType])
+  @@index([processed])
+  @@map("webhook_events")
+}
+
+model EmailLog {
+  id           Int            @id @default(autoincrement())
+  tenantId     Int?           @map("tenant_id")
+  toEmail      String         @map("to_email") @db.VarChar(150)
+  subject      String         @db.VarChar(255)
+  templateName String         @map("template_name") @db.VarChar(100)
+  refType      String?        @map("ref_type") @db.VarChar(50)
+  refId        Int?           @map("ref_id")
+  status       EmailLogStatus @default(SENT)
+  errorMessage String?        @map("error_message") @db.Text
+  sentAt       DateTime       @default(now()) @map("sent_at")
+  createdAt    DateTime       @default(now()) @map("created_at")
+  updatedAt    DateTime       @updatedAt @map("updated_at")
+  tenant       Tenant?        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([toEmail])
+  @@index([status])
+  @@map("email_logs")
+}
+
+model AuditLog {
+  id         Int      @id @default(autoincrement())
+  tenantId   Int?     @map("tenant_id")
+  userId     Int?     @map("user_id")
+  action     String   @db.VarChar(100)
+  entityType String   @map("entity_type") @db.VarChar(100)
+  entityId   Int?     @map("entity_id")
+  details    Json?
+  ipAddress  String?  @map("ip_address") @db.VarChar(45)
+  userAgent  String?  @map("user_agent") @db.VarChar(255)
+  createdAt  DateTime @default(now()) @map("created_at")
+  tenant     Tenant?  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user       User?    @relation(fields: [userId], references: [id])
+
+  @@index([tenantId])
+  @@index([action])
+  @@index([createdAt])
+  @@index([userId], map: "audit_logs_user_id_fkey")
+  @@map("audit_logs")
+}
+
+enum PlatformRole {
+  PLATFORM_OWNER
+  PLATFORM_ADMIN
+}
+
+enum TenantRole {
+  TENANT_OWNER
+  TENANT_ADMIN
+  EVENT_MANAGER
+  FINANCE_VIEWER
+  CHECKIN_STAFF
+}
+
+enum TenantStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  SUSPENDED
+  INACTIVE
+}
+
+enum SubscriptionPlan {
+  FREE
+  STARTER
+  BUSINESS
+  ENTERPRISE
+}
+
+enum EventStatus {
+  DRAFT
+  LIVE
+  CLOSED
+  CANCELLED
+}
+
+enum ActivityStatus {
+  DRAFT
+  PUBLISHED
+  CLOSED
+  CANCELLED
+}
+
+enum FormFieldType {
+  TEXT
+  EMAIL
+  PHONE
+  NUMBER
+  SELECT
+  RADIO
+  CHECKBOX
+  TEXTAREA
+  DATE
+  FILE
+  MULTISELECT
+  LONGTEXT
+}
+
+enum RegistrationStatus {
+  PENDING
+  PAYMENT_PENDING
+  CONFIRMED
+  CANCELLED
+  REFUNDED
+  EXPIRED
+}
+
+enum OrderStatus {
+  CREATED
+  PAYMENT_PENDING
+  PAID
+  FAILED
+  CANCELLED
+  REFUNDED
+}
+
+enum PaymentStatus {
+  CREATED
+  PENDING
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  REFUNDED
+}
+
+enum TicketStatus {
+  ACTIVE
+  USED
+  CANCELLED
+  EXPIRED
+}
+
+enum OtpIdentifierType {
+  EMAIL
+  PHONE
+}
+
+enum OtpPurpose {
+  CUSTOMER_LOGIN
+  PASSWORD_RESET
+}
+
+enum EmailLogStatus {
+  SENT
+  FAILED
+}

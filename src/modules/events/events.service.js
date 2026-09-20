@@ -1,13 +1,4 @@
-import { Op } from 'sequelize';
-import {
-  Event,
-  Activity,
-  TicketType,
-  RegistrationForm,
-  Registration,
-  Checkin,
-  Ticket,
-} from '../../database/models/index.js';
+import prisma from '../../lib/prisma.js';
 import { NotFoundError, ConflictError, ForbiddenError } from '../../utils/errors.js';
 import { uniqueSlug } from '../../utils/generators.js';
 import { pick } from '../../utils/helpers.js';
@@ -45,26 +36,52 @@ const EVENT_FIELDS = [
 const applyScope = (where, scope) => {
   if (scope && isEventScopedRole(scope.role)) {
     const ids = Array.isArray(scope.assignedEvents) ? scope.assignedEvents : [];
-    where.id = { [Op.in]: ids.length ? ids : [0] };
+    where.id = { in: ids.length ? ids : [0] };
   }
   return where;
 };
 
+const sanitizeEventData = (payload) => {
+  const data = pick(payload, EVENT_FIELDS);
+  if (data.eventDate && typeof data.eventDate === 'string') {
+    data.eventDate = new Date(data.eventDate);
+  }
+  if (data.startAt && typeof data.startAt === 'string') {
+    data.startAt = new Date(data.startAt);
+  }
+  if (data.endAt && typeof data.endAt === 'string') {
+    data.endAt = new Date(data.endAt);
+  }
+  if (data.registrationDeadline && typeof data.registrationDeadline === 'string') {
+    data.registrationDeadline = new Date(data.registrationDeadline);
+  }
+  if (data.registrationOpenAt && typeof data.registrationOpenAt === 'string') {
+    data.registrationOpenAt = new Date(data.registrationOpenAt);
+  }
+  if (data.registrationCloseAt && typeof data.registrationCloseAt === 'string') {
+    data.registrationCloseAt = new Date(data.registrationCloseAt);
+  }
+  return data;
+};
+
 export async function createEvent(tenantId, userId, payload, req) {
+  const tId = Number(tenantId);
   const slug = await uniqueSlug(payload.title, async (candidate) =>
-    Boolean(await Event.findOne({ where: { tenantId, slug: candidate } })),
+    Boolean(await prisma.event.findFirst({ where: { tenantId: tId, slug: candidate } })),
   );
 
-  const event = await Event.create({
-    ...pick(payload, EVENT_FIELDS),
-    slug,
-    tenantId,
-    createdBy: userId,
-    status: payload.status || 'DRAFT',
+  const event = await prisma.event.create({
+    data: {
+      ...sanitizeEventData(payload),
+      slug,
+      tenantId: tId,
+      createdBy: userId ? Number(userId) : null,
+      status: payload.status || 'DRAFT',
+    },
   });
 
   await recordAudit({
-    tenantId,
+    tenantId: tId,
     userId,
     action: AUDIT_ACTIONS.EVENT_CREATED,
     entityType: 'event',
@@ -78,32 +95,33 @@ export async function createEvent(tenantId, userId, payload, req) {
 
 export async function listEvents(tenantId, query, scope) {
   const { page, limit, offset } = parsePagination(query);
-  const where = applyScope({ tenantId }, scope);
+  const tId = Number(tenantId);
+  const where = applyScope({ tenantId: tId }, scope);
   if (query.status) where.status = query.status;
-  if (query.search) where.title = { [Op.like]: `%${query.search}%` };
+  if (query.search) where.title = { contains: query.search };
 
-  const { rows, count } = await Event.findAndCountAll({
-    where,
-    include: [
-      { model: TicketType, as: 'ticketTypes', attributes: ['id', 'name', 'price', 'quantity', 'soldCount', 'isActive'] },
-      {
-        model: Registration,
-        as: 'registrations',
-        attributes: ['id', 'quantity', 'status'],
-        required: false,
+  const [count, rows] = await Promise.all([
+    prisma.event.count({ where }),
+    prisma.event.findMany({
+      where,
+      skip: offset,
+      take: limit,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        ticketTypes: {
+          select: { id: true, name: true, price: true, quantity: true, soldCount: true, isActive: true },
+        },
+        registrations: {
+          select: { id: true, quantity: true, status: true },
+        },
       },
-    ],
-    order: [['createdAt', 'DESC']],
-    limit,
-    offset,
-    distinct: true,
-  });
+    }),
+  ]);
 
   const withCounts = rows.map((row) => {
-    const plain = row.toJSON();
-    const confirmed = (plain.registrations || []).filter((r) => r.status === 'CONFIRMED');
+    const confirmed = (row.registrations || []).filter((r) => r.status === 'CONFIRMED');
     return {
-      ...plain,
+      ...row,
       stats: {
         confirmedRegistrations: confirmed.length,
         ticketsSold: confirmed.reduce((sum, r) => sum + r.quantity, 0),
@@ -116,46 +134,62 @@ export async function listEvents(tenantId, query, scope) {
 }
 
 export async function getEvent(tenantId, id, scope, { withChildren = true } = {}) {
-  const where = applyScope({ id, tenantId }, scope);
-  const include = withChildren
-    ? [
-        { model: Activity, as: 'activities', separate: true, order: [['sortOrder', 'ASC']],
-          include: [{ model: TicketType, as: 'ticketTypes', separate: true, order: [['sortOrder', 'ASC']] }],
-        },
-        { model: TicketType, as: 'ticketTypes', separate: true, order: [['sortOrder', 'ASC']] },
-        { model: RegistrationForm, as: 'formFields', separate: true, order: [['sortOrder', 'ASC']] },
-      ]
-    : [];
+  const tId = Number(tenantId);
+  const eventId = Number(id);
+  const where = applyScope({ id: eventId, tenantId: tId }, scope);
 
-  const event = await Event.findOne({ where, include });
+  const include = withChildren
+    ? {
+        activities: {
+          orderBy: { sortOrder: 'asc' },
+          include: { ticketTypes: { orderBy: { sortOrder: 'asc' } } },
+        },
+        ticketTypes: { orderBy: { sortOrder: 'asc' } },
+        registrationForms: { orderBy: { sortOrder: 'asc' } },
+      }
+    : undefined;
+
+  const event = await prisma.event.findFirst({ where, include });
   if (!event) throw new NotFoundError('Event not found');
 
   const [confirmedRegistrations, ticketsSold, checkedIn] = await Promise.all([
-    Registration.count({ where: { eventId: event.id, tenantId, status: 'CONFIRMED' } }),
-    Ticket.count({ where: { eventId: event.id, tenantId } }),
-    Checkin.count({ where: { eventId: event.id, tenantId } }),
+    prisma.registration.count({ where: { eventId: event.id, tenantId: tId, status: 'CONFIRMED' } }),
+    prisma.ticket.count({ where: { eventId: event.id, tenantId: tId } }),
+    prisma.checkin.count({ where: { eventId: event.id, tenantId: tId } }),
   ]);
 
-  return { event, stats: { confirmedRegistrations, ticketsSold, checkedIn } };
+  const eventObj = {
+    ...event,
+    formFields: event.registrationForms || [],
+  };
+
+  return { event: eventObj, stats: { confirmedRegistrations, ticketsSold, checkedIn } };
 }
 
 export async function updateEvent(tenantId, id, payload, userId, req, scope) {
-  const where = applyScope({ id, tenantId }, scope);
-  const event = await Event.findOne({ where });
+  const tId = Number(tenantId);
+  const eventId = Number(id);
+  const where = applyScope({ id: eventId, tenantId: tId }, scope);
+  const event = await prisma.event.findFirst({ where });
   if (!event) throw new NotFoundError('Event not found');
 
-  const changes = pick(payload, EVENT_FIELDS);
+  const changes = sanitizeEventData(payload);
   if (changes.title && changes.title !== event.title) {
     changes.slug = await uniqueSlug(changes.title, async (candidate) =>
-      Boolean(await Event.findOne({ where: { tenantId, slug: candidate, id: { [Op.ne]: id } } })),
+      Boolean(await prisma.event.findFirst({ where: { tenantId: tId, slug: candidate, id: { not: eventId } } })),
     );
   }
-  if (changes.settings) changes.settings = { ...(event.settings || {}), ...changes.settings };
+  if (changes.settings) {
+    changes.settings = { ...(event.settings || {}), ...changes.settings };
+  }
 
-  await event.update(changes);
+  const updated = await prisma.event.update({
+    where: { id: event.id },
+    data: changes,
+  });
 
   await recordAudit({
-    tenantId,
+    tenantId: tId,
     userId,
     action: AUDIT_ACTIONS.EVENT_UPDATED,
     entityType: 'event',
@@ -164,58 +198,68 @@ export async function updateEvent(tenantId, id, payload, userId, req, scope) {
     req,
   });
 
-  return event;
+  return updated;
 }
 
 export async function changeEventStatus(tenantId, id, status, userId, req, scope) {
-  const where = applyScope({ id, tenantId }, scope);
-  const event = await Event.findOne({ where });
+  const tId = Number(tenantId);
+  const eventId = Number(id);
+  const where = applyScope({ id: eventId, tenantId: tId }, scope);
+  const event = await prisma.event.findFirst({ where });
   if (!event) throw new NotFoundError('Event not found');
 
   if (status === 'LIVE') {
-    const ticketTypeCount = await TicketType.count({ where: { eventId: event.id, isActive: true } });
+    const ticketTypeCount = await prisma.ticketType.count({ where: { eventId: event.id, isActive: true } });
     if (!ticketTypeCount) throw new ConflictError('Add at least one active ticket type before publishing');
   }
 
-  await event.update({ status });
+  const previousStatus = event.status;
+  const updated = await prisma.event.update({
+    where: { id: event.id },
+    data: { status },
+  });
 
   await recordAudit({
-    tenantId,
+    tenantId: tId,
     userId,
     action: AUDIT_ACTIONS.EVENT_STATUS_CHANGED,
     entityType: 'event',
     entityId: event.id,
-    details: { from: event.previous('status'), to: status },
+    details: { from: previousStatus, to: status },
     req,
   });
 
-  return event;
+  return updated;
 }
 
 export async function deleteEvent(tenantId, id, userId, req) {
-  const event = await Event.findOne({ where: { id, tenantId } });
+  const tId = Number(tenantId);
+  const eventId = Number(id);
+  const event = await prisma.event.findFirst({ where: { id: eventId, tenantId: tId } });
   if (!event) throw new NotFoundError('Event not found');
 
-  const confirmed = await Registration.count({ where: { eventId: id, tenantId, status: 'CONFIRMED' } });
+  const confirmed = await prisma.registration.count({ where: { eventId, tenantId: tId, status: 'CONFIRMED' } });
   if (confirmed > 0) throw new ConflictError('This event has confirmed bookings — cancel it instead of deleting');
 
-  await event.destroy();
+  await prisma.event.delete({ where: { id: event.id } });
 
   await recordAudit({
-    tenantId,
+    tenantId: tId,
     userId,
     action: AUDIT_ACTIONS.EVENT_DELETED,
     entityType: 'event',
-    entityId: id,
+    entityId: eventId,
     details: { title: event.title },
     req,
   });
 
-  return { id };
+  return { id: eventId };
 }
 
 export async function assertEventInTenant(tenantId, eventId) {
-  const event = await Event.findOne({ where: { id: eventId, tenantId } });
+  const event = await prisma.event.findFirst({
+    where: { id: Number(eventId), tenantId: Number(tenantId) },
+  });
   if (!event) throw new NotFoundError('Event not found');
   return event;
 }

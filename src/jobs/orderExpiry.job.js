@@ -1,5 +1,4 @@
-import { Op } from 'sequelize';
-import { sequelize, clampDecrement, Order, Registration, TicketType } from '../database/models/index.js';
+import prisma from '../lib/prisma.js';
 import { ORDER_EXPIRY_MINUTES } from '../utils/constants.js';
 import { logger } from '../utils/logger.js';
 
@@ -12,24 +11,33 @@ const INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
 export async function expireStaleOrders() {
   const cutoff = new Date(Date.now() - ORDER_EXPIRY_MINUTES * 60 * 1000);
 
-  const stale = await Order.findAll({
-    where: { status: { [Op.in]: ['CREATED', 'PAYMENT_PENDING'] }, createdAt: { [Op.lt]: cutoff } },
-    include: [{ model: Registration, as: 'registration' }],
-    limit: 200,
+  const stale = await prisma.order.findMany({
+    where: {
+      status: { in: ['CREATED', 'PAYMENT_PENDING'] },
+      createdAt: { lt: cutoff },
+    },
+    include: { registration: true },
+    take: 200,
   });
 
   for (const order of stale) {
     // eslint-disable-next-line no-await-in-loop
-    await sequelize.transaction(async (t) => {
+    await prisma.$transaction(async (tx) => {
       const registration = order.registration;
-      await order.update({ status: 'CANCELLED' }, { transaction: t });
+      await tx.order.update({
+        where: { id: order.id },
+        data: { status: 'CANCELLED' },
+      });
 
       if (registration && !['CONFIRMED', 'REFUNDED'].includes(registration.status)) {
-        await registration.update({ status: 'EXPIRED' }, { transaction: t });
-        await TicketType.update(
-          { soldCount: clampDecrement('sold_count', registration.quantity) },
-          { where: { id: registration.ticketTypeId }, transaction: t },
-        );
+        await tx.registration.update({
+          where: { id: registration.id },
+          data: { status: 'EXPIRED' },
+        });
+        await tx.ticketType.update({
+          where: { id: registration.ticketTypeId },
+          data: { soldCount: { decrement: registration.quantity } },
+        });
       }
     });
   }

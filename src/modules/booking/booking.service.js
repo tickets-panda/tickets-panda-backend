@@ -1,18 +1,4 @@
-import { fn, col, Op } from 'sequelize';
-import {
-  sequelize,
-  Event,
-  Activity,
-  TicketType,
-  Registration,
-  RegistrationForm,
-  RegistrationData,
-  Customer,
-  Order,
-  Payment,
-  Ticket,
-  Tenant,
-} from '../../database/models/index.js';
+import prisma from '../../lib/prisma.js';
 import { NotFoundError, ConflictError, ValidationError, AppError } from '../../utils/errors.js';
 import { normaliseEmail, normalisePhone } from '../../utils/helpers.js';
 import { generateOrderRef, generateRegistrationRef } from '../../utils/generators.js';
@@ -31,12 +17,13 @@ import { logger } from '../../utils/logger.js';
  * 1. Initiate booking
  * ------------------------------------------------------------------ */
 
-async function validateAndStoreFormData(registration, eventId, formData, transaction) {
-  const where = { eventId };
+async function validateAndStoreFormData(registration, eventId, formData, tx) {
+  const db = tx || prisma;
+  const where = { eventId: Number(eventId) };
   if (registration.activityId) {
-    where[Op.or] = [{ activityId: registration.activityId }, { activityId: null }];
+    where.OR = [{ activityId: Number(registration.activityId) }, { activityId: null }];
   }
-  const fields = await RegistrationForm.findAll({ where, transaction });
+  const fields = await db.registrationForm.findMany({ where });
   const rows = [];
 
   for (const field of fields) {
@@ -48,10 +35,14 @@ async function validateAndStoreFormData(registration, eventId, formData, transac
         { field: field.fieldName, message: `${field.fieldLabel} is required` },
       ]);
     }
-    if (value) rows.push({ registrationId: registration.id, formFieldId: field.id, fieldValue: value });
+    if (value) {
+      rows.push({ registrationId: registration.id, formFieldId: field.id, fieldValue: value });
+    }
   }
 
-  if (rows.length) await RegistrationData.bulkCreate(rows, { transaction });
+  if (rows.length) {
+    await db.registrationData.createMany({ data: rows });
+  }
   return rows.length;
 }
 
@@ -64,15 +55,15 @@ export async function initiateBooking(payload, req) {
     throw new AppError('Online payments are not configured yet. Please contact the organizer.', 503);
   }
 
-  const event = await Event.findOne({ where: { id: eventId } });
+  const event = await prisma.event.findUnique({ where: { id: Number(eventId) } });
   if (!event) throw new NotFoundError('Event not found');
   if (event.status !== 'LIVE') throw new ConflictError('This event is not open for registration');
   if (event.registrationDeadline && new Date(event.registrationDeadline) < new Date()) {
     throw new ConflictError('Registration for this event has closed');
   }
 
-  const ticketType = await TicketType.findOne({
-    where: { id: ticketTypeId, eventId: event.id, tenantId: event.tenantId, isActive: true },
+  const ticketType = await prisma.ticketType.findFirst({
+    where: { id: Number(ticketTypeId), eventId: event.id, tenantId: event.tenantId, isActive: true },
   });
   if (!ticketType) throw new NotFoundError('This ticket type is not available');
 
@@ -83,62 +74,68 @@ export async function initiateBooking(payload, req) {
   const amount = Number(ticketType.price) * quantity;
   const currency = ticketType.currency || 'INR';
 
-  const { registration, order, customerRecord } = await sequelize.transaction(async (t) => {
-    // Row-lock the ticket type so concurrent bookings cannot oversell.
-    const locked = await TicketType.findByPk(ticketType.id, { lock: t.LOCK.UPDATE, transaction: t });
-    if (locked.soldCount + quantity > locked.quantity) {
+  const { registration, order, customerRecord } = await prisma.$transaction(async (tx) => {
+    // Row-lock the ticket type in MySQL so concurrent bookings cannot oversell.
+    const [locked] = await tx.$queryRaw`SELECT * FROM ticket_types WHERE id = ${ticketType.id} FOR UPDATE`;
+    if (!locked) throw new NotFoundError('Ticket type not found');
+    if (locked.sold_count + quantity > locked.quantity) {
       throw new ConflictError('Not enough tickets remaining for this ticket type');
     }
 
     // Event-level capacity guard (sum of seats held across all ticket types).
     if (event.maxCapacity) {
-      const held = await TicketType.findOne({
+      const heldAgg = await tx.ticketType.aggregate({
+        _sum: { soldCount: true },
         where: { eventId: event.id },
-        attributes: [[fn('COALESCE', fn('SUM', col('sold_count')), 0), 'held']],
-        raw: true,
-        transaction: t,
       });
-      if (Number(held?.held || 0) + quantity > event.maxCapacity) {
+      const held = Number(heldAgg._sum.soldCount || 0);
+      if (held + quantity > event.maxCapacity) {
         throw new ConflictError('This event has reached its maximum capacity');
       }
     }
 
-    await locked.increment('soldCount', { by: quantity, transaction: t });
+    await tx.ticketType.update({
+      where: { id: ticketType.id },
+      data: { soldCount: { increment: quantity } },
+    });
 
-    // Find-or-create the global customer record.
-    let customerRecord = await Customer.findOne({ where: { email }, transaction: t });
+    // Find-or-create customer record.
+    let customerRecord = await tx.customer.findFirst({ where: { email } });
     if (customerRecord) {
       const updates = {};
       if (customer.name && customer.name !== customerRecord.name) updates.name = customer.name;
       const phone = normalisePhone(customer.phone);
       if (phone && phone !== customerRecord.phone) updates.phone = phone;
-      if (Object.keys(updates).length) await customerRecord.update(updates, { transaction: t });
+      if (Object.keys(updates).length) {
+        customerRecord = await tx.customer.update({
+          where: { id: customerRecord.id },
+          data: updates,
+        });
+      }
     } else {
-      customerRecord = await Customer.create(
-        { name: customer.name, email, phone: normalisePhone(customer.phone) },
-        { transaction: t },
-      );
+      customerRecord = await tx.customer.create({
+        data: { name: customer.name, email, phone: normalisePhone(customer.phone) },
+      });
     }
 
-    const finalActivityId = activityId || locked.activityId || null;
-    const registration = await Registration.create(
-      {
+    const finalActivityId = activityId ? Number(activityId) : (ticketType.activityId ? Number(ticketType.activityId) : null);
+    const registration = await tx.registration.create({
+      data: {
         registrationRef: generateRegistrationRef(),
         tenantId: event.tenantId,
         eventId: event.id,
         activityId: finalActivityId,
         customerId: customerRecord.id,
-        ticketTypeId: locked.id,
+        ticketTypeId: ticketType.id,
         quantity,
         status: 'PAYMENT_PENDING',
       },
-      { transaction: t },
-    );
+    });
 
-    await validateAndStoreFormData(registration, event.id, formData, t);
+    await validateAndStoreFormData(registration, event.id, formData, tx);
 
-    const order = await Order.create(
-      {
+    const order = await tx.order.create({
+      data: {
         orderRef: generateOrderRef(),
         tenantId: event.tenantId,
         registrationId: registration.id,
@@ -147,8 +144,7 @@ export async function initiateBooking(payload, req) {
         currency,
         status: 'CREATED',
       },
-      { transaction: t },
-    );
+    });
 
     return { registration, order, customerRecord };
   });
@@ -165,18 +161,21 @@ export async function initiateBooking(payload, req) {
     });
   } catch (err) {
     logger.error(`Payment provider order creation failed: ${err.message}`);
-    await sequelize.transaction(async (t) => {
-      await order.update({ status: 'FAILED' }, { transaction: t });
-      await registration.update({ status: 'CANCELLED' }, { transaction: t });
-      await TicketType.decrement('soldCount', { by: quantity, where: { id: ticketType.id }, transaction: t });
+    await prisma.$transaction(async (tx) => {
+      await tx.order.update({ where: { id: order.id }, data: { status: 'FAILED' } });
+      await tx.registration.update({ where: { id: registration.id }, data: { status: 'CANCELLED' } });
+      await tx.ticketType.update({
+        where: { id: ticketType.id },
+        data: { soldCount: { decrement: quantity } },
+      });
     });
     throw new AppError(`Could not start the payment: ${err.message}`, 502);
   }
 
-  await sequelize.transaction(async (t) => {
-    await order.update({ status: 'PAYMENT_PENDING' }, { transaction: t });
-    await Payment.create(
-      {
+  await prisma.$transaction(async (tx) => {
+    await tx.order.update({ where: { id: order.id }, data: { status: 'PAYMENT_PENDING' } });
+    await tx.payment.create({
+      data: {
         orderId: order.id,
         tenantId: event.tenantId,
         provider: providerResult.provider,
@@ -186,8 +185,7 @@ export async function initiateBooking(payload, req) {
         currency,
         status: 'CREATED',
       },
-      { transaction: t },
-    );
+    });
   });
 
   await recordAudit({
@@ -234,23 +232,23 @@ export async function verifyPayment(payload, req) {
   } = payload;
 
   const whereClause = {};
-  if (orderId) whereClause.id = orderId;
+  if (orderId) whereClause.id = Number(orderId);
   else if (orderRef) whereClause.orderRef = orderRef;
   else throw new ValidationError('orderId or orderRef is required');
 
-  const order = await Order.findOne({
+  const order = await prisma.order.findFirst({
     where: whereClause,
-    include: [
-      { model: Registration, as: 'registration' },
-      { model: Payment, as: 'payment' },
-      { model: Customer, as: 'customer' },
-    ],
+    include: {
+      registration: true,
+      payments: true,
+      customer: true,
+    },
   });
   if (!order) throw new NotFoundError('Order not found');
 
   // Idempotency — replaying on an already paid order returns the existing tickets.
   if (order.status === 'PAID') {
-    const existing = await Ticket.findAll({ where: { orderId: order.id } });
+    const existing = await prisma.ticket.findMany({ where: { orderId: order.id } });
     return {
       order,
       status: 'PAID',
@@ -267,13 +265,13 @@ export async function verifyPayment(payload, req) {
     throw new ConflictError(`This order can no longer be paid (status: ${order.status})`);
   }
 
-  const payment = order.payment;
+  const payment = order.payments?.[0];
   if (!payment) throw new NotFoundError('Payment record not found for this order');
 
   const providerName = payment.provider || 'local';
 
   // 1. LOCAL TEST PAYMENT PROVIDER
-  if (providerName === 'local') {
+  if (providerName === 'local' || providerName === 'LOCAL_TEST') {
     const verification = await paymentService.verifyPaymentWithProvider({
       providerOrderId: payment.providerOrderId,
       providerPaymentId: razorpayPaymentId || payload.providerPaymentId,
@@ -283,25 +281,24 @@ export async function verifyPayment(payload, req) {
     });
 
     if (verification.status === 'FAILED') {
-      await sequelize.transaction(async (t) => {
-        await payment.update(
-          {
+      await prisma.$transaction(async (tx) => {
+        await tx.payment.update({
+          where: { id: payment.id },
+          data: {
             status: 'FAILED',
             providerPaymentId: verification.providerPaymentId,
             failedReason: verification.failedReason,
           },
-          { transaction: t },
-        );
-        await order.update({ status: 'FAILED' }, { transaction: t });
+        });
+        await tx.order.update({ where: { id: order.id }, data: { status: 'FAILED' } });
 
         // Release inventory held by this order
-        const registration = order.registration || (await Registration.findByPk(order.registrationId, { transaction: t }));
+        const registration = order.registration || (await tx.registration.findUnique({ where: { id: order.registrationId } }));
         if (registration) {
-          await registration.update({ status: 'CANCELLED' }, { transaction: t });
-          await TicketType.decrement('soldCount', {
-            by: registration.quantity,
+          await tx.registration.update({ where: { id: registration.id }, data: { status: 'CANCELLED' } });
+          await tx.ticketType.update({
             where: { id: registration.ticketTypeId },
-            transaction: t,
+            data: { soldCount: { decrement: registration.quantity } },
           });
         }
       });
@@ -325,9 +322,12 @@ export async function verifyPayment(payload, req) {
     }
 
     if (verification.status === 'PENDING') {
-      await payment.update({
-        status: 'PENDING',
-        providerPaymentId: verification.providerPaymentId,
+      await prisma.payment.update({
+        where: { id: payment.id },
+        data: {
+          status: 'PENDING',
+          providerPaymentId: verification.providerPaymentId,
+        },
       });
       return {
         order,
@@ -363,7 +363,6 @@ export async function verifyPayment(payload, req) {
     }
     if (!isRazorpayConfigured()) throw new AppError('Online payments are not configured yet.', 503);
 
-    // Cryptographic signature verification
     const signatureValid = verifyRazorpaySignature(
       razorpayOrderId,
       razorpayPaymentId,
@@ -372,9 +371,9 @@ export async function verifyPayment(payload, req) {
     );
 
     if (!signatureValid) {
-      await sequelize.transaction(async (t) => {
-        await payment.update({ status: 'FAILED', failedReason: 'Signature verification failed' }, { transaction: t });
-        await order.update({ status: 'FAILED' }, { transaction: t });
+      await prisma.$transaction(async (tx) => {
+        await tx.payment.update({ where: { id: payment.id }, data: { status: 'FAILED', failedReason: 'Signature verification failed' } });
+        await tx.order.update({ where: { id: order.id }, data: { status: 'FAILED' } });
       });
       await recordAudit({
         tenantId: order.tenantId,
@@ -424,7 +423,6 @@ export async function verifyPayment(payload, req) {
 /**
  * Marks an order paid, generates its tickets, and sends notifications.
  * Idempotent — safe to call from both the checkout verifier and the webhook.
- * Expects order.payment and order.registration to be loaded.
  */
 export async function finalisePaidOrder({
   order,
@@ -436,15 +434,16 @@ export async function finalisePaidOrder({
   source = 'webhook',
 }) {
   if (order.status === 'PAID') {
-    return Ticket.findAll({ where: { orderId: order.id } });
+    return prisma.ticket.findMany({ where: { orderId: order.id } });
   }
 
-  const registration = order.registration || (await Registration.findByPk(order.registrationId));
+  const registration = order.registration || (await prisma.registration.findUnique({ where: { id: order.registrationId } }));
 
-  const tickets = await sequelize.transaction(async (t) => {
+  const tickets = await prisma.$transaction(async (tx) => {
     const isRazorpay = payment.provider === 'razorpay';
-    await payment.update(
-      {
+    await tx.payment.update({
+      where: { id: payment.id },
+      data: {
         providerPaymentId: providerPaymentId || payment.providerPaymentId,
         providerSignature: providerSignature || payment.providerSignature,
         razorpayPaymentId: isRazorpay ? providerPaymentId : payment.razorpayPaymentId,
@@ -453,20 +452,25 @@ export async function finalisePaidOrder({
         method: method || payment.method || 'TEST_LOCAL',
         capturedAt: new Date(),
       },
-      { transaction: t },
-    );
-    await order.update({ status: 'PAID' }, { transaction: t });
-    await registration.update({ status: 'CONFIRMED' }, { transaction: t });
+    });
+    await tx.order.update({
+      where: { id: order.id },
+      data: { status: 'PAID' },
+    });
+    await tx.registration.update({
+      where: { id: registration.id },
+      data: { status: 'CONFIRMED' },
+    });
 
-    return generateTicketsForOrder({ order, registration, transaction: t });
+    return generateTicketsForOrder({ order, registration, tx });
   });
 
-  const customer = order.customer || (await Customer.findByPk(order.customerId));
+  const customer = order.customer || (await prisma.customer.findUnique({ where: { id: order.customerId } }));
   const [event, activity, ticketType, tenant] = await Promise.all([
-    Event.findByPk(registration.eventId),
-    registration.activityId ? Activity.findByPk(registration.activityId) : null,
-    TicketType.findByPk(registration.ticketTypeId),
-    Tenant.findByPk(order.tenantId),
+    prisma.event.findUnique({ where: { id: registration.eventId } }),
+    registration.activityId ? prisma.activity.findUnique({ where: { id: registration.activityId } }) : null,
+    prisma.ticketType.findUnique({ where: { id: registration.ticketTypeId } }),
+    prisma.tenant.findUnique({ where: { id: order.tenantId } }),
   ]);
 
   await deliverTickets({ order, registration, customer, event, activity, ticketType, tenant, tickets });
@@ -541,36 +545,30 @@ async function deliverTickets({ order, registration, customer, event, activity, 
  * ------------------------------------------------------------------ */
 
 export async function getCheckoutDetails(orderRef) {
-  const order = await Order.findOne({
+  const order = await prisma.order.findUnique({
     where: { orderRef },
-    include: [
-      { model: Customer, as: 'customer', attributes: ['id', 'name', 'email', 'phone'] },
-      { model: Payment, as: 'payment' },
-      {
-        model: Registration,
-        as: 'registration',
-        include: [
-          {
-            model: Event,
-            as: 'event',
-            attributes: ['id', 'title', 'slug', 'bannerUrl', 'eventDate', 'eventTimeStart', 'venueName', 'venueAddress'],
+    include: {
+      customer: { select: { id: true, name: true, email: true, phone: true } },
+      payments: true,
+      registration: {
+        include: {
+          event: {
+            select: { id: true, title: true, slug: true, bannerUrl: true, eventDate: true, eventTimeStart: true, venueName: true, venueAddress: true },
           },
-          {
-            model: Activity,
-            as: 'activity',
-            attributes: ['id', 'title', 'slug', 'venue', 'startsAt'],
+          activity: {
+            select: { id: true, title: true, slug: true, venue: true, startsAt: true },
           },
-          {
-            model: TicketType,
-            as: 'ticketType',
-            attributes: ['id', 'name', 'price', 'currency'],
+          ticketType: {
+            select: { id: true, name: true, price: true, currency: true },
           },
-        ],
+        },
       },
-    ],
+    },
   });
 
   if (!order) throw new NotFoundError('Order not found');
+
+  const payment = order.payments?.[0] || null;
 
   return {
     orderRef: order.orderRef,
@@ -579,32 +577,34 @@ export async function getCheckoutDetails(orderRef) {
     amount: Number(order.amount),
     currency: order.currency,
     quantity: order.registration?.quantity || 1,
-    paymentProvider: order.payment?.provider || (env.payments.isLocal ? 'local' : 'razorpay'),
-    providerOrderId: order.payment?.providerOrderId || order.payment?.razorpayOrderId,
+    paymentProvider: payment?.provider || (env.payments?.isLocal ? 'local' : 'razorpay'),
+    providerOrderId: payment?.providerOrderId || payment?.razorpayOrderId,
     customer: order.customer,
     event: order.registration?.event,
     activity: order.registration?.activity,
     ticketType: order.registration?.ticketType,
-    payment: order.payment ? {
-      id: order.payment.id,
-      provider: order.payment.provider,
-      providerOrderId: order.payment.providerOrderId,
-      status: order.payment.status,
-      method: order.payment.method,
-      failedReason: order.payment.failedReason,
-    } : null,
+    payment: payment
+      ? {
+          id: payment.id,
+          provider: payment.provider,
+          providerOrderId: payment.providerOrderId,
+          status: payment.status,
+          method: payment.method,
+          failedReason: payment.failedReason,
+        }
+      : null,
     createdAt: order.createdAt,
   };
 }
 
 export async function retryOrder(orderRef, req) {
-  const order = await Order.findOne({
+  const order = await prisma.order.findUnique({
     where: { orderRef },
-    include: [
-      { model: Customer, as: 'customer' },
-      { model: Payment, as: 'payment' },
-      { model: Registration, as: 'registration' },
-    ],
+    include: {
+      customer: true,
+      payments: true,
+      registration: true,
+    },
   });
 
   if (!order) throw new NotFoundError('Order not found');
@@ -624,7 +624,7 @@ export async function retryOrder(orderRef, req) {
   const registration = order.registration;
   if (!registration) throw new NotFoundError('Registration record not found for this order');
 
-  const event = await Event.findByPk(registration.eventId);
+  const event = await prisma.event.findUnique({ where: { id: registration.eventId } });
   if (!event) throw new NotFoundError('Event not found');
   if (event.status !== 'LIVE') throw new ConflictError('This event is no longer open for registration');
   if (event.registrationDeadline && new Date(event.registrationDeadline) < new Date()) {
@@ -633,31 +633,40 @@ export async function retryOrder(orderRef, req) {
 
   const customer = order.customer;
   const quantity = registration.quantity;
+  const payment = order.payments?.[0] || null;
 
   // Re-check inventory and re-reserve tickets
-  await sequelize.transaction(async (t) => {
-    const locked = await TicketType.findByPk(registration.ticketTypeId, { lock: t.LOCK.UPDATE, transaction: t });
-    if (!locked || !locked.isActive) {
+  await prisma.$transaction(async (tx) => {
+    const [locked] = await tx.$queryRaw`SELECT * FROM ticket_types WHERE id = ${registration.ticketTypeId} FOR UPDATE`;
+    if (!locked || !locked.is_active) {
       throw new ConflictError('The ticket type is no longer available');
     }
-    if (locked.soldCount + quantity > locked.quantity) {
+    if (locked.sold_count + quantity > locked.quantity) {
       throw new ConflictError('Not enough tickets remaining to retry this order');
     }
     if (event.maxCapacity) {
-      const held = await TicketType.findOne({
+      const heldAgg = await tx.ticketType.aggregate({
+        _sum: { soldCount: true },
         where: { eventId: event.id },
-        attributes: [[fn('COALESCE', fn('SUM', col('sold_count')), 0), 'held']],
-        raw: true,
-        transaction: t,
       });
-      if (Number(held?.held || 0) + quantity > event.maxCapacity) {
+      const held = Number(heldAgg._sum.soldCount || 0);
+      if (held + quantity > event.maxCapacity) {
         throw new ConflictError('This event has reached its maximum capacity');
       }
     }
 
-    await locked.increment('soldCount', { by: quantity, transaction: t });
-    await registration.update({ status: 'PAYMENT_PENDING' }, { transaction: t });
-    await order.update({ status: 'PAYMENT_PENDING' }, { transaction: t });
+    await tx.ticketType.update({
+      where: { id: registration.ticketTypeId },
+      data: { soldCount: { increment: quantity } },
+    });
+    await tx.registration.update({
+      where: { id: registration.id },
+      data: { status: 'PAYMENT_PENDING' },
+    });
+    await tx.order.update({
+      where: { id: order.id },
+      data: { status: 'PAYMENT_PENDING' },
+    });
 
     const providerResult = await paymentService.createPaymentOrder({
       order,
@@ -668,9 +677,10 @@ export async function retryOrder(orderRef, req) {
       notes: { eventId: String(event.id), registrationRef: registration.registrationRef, retry: true },
     });
 
-    if (order.payment) {
-      await order.payment.update(
-        {
+    if (payment) {
+      await tx.payment.update({
+        where: { id: payment.id },
+        data: {
           provider: providerResult.provider,
           providerOrderId: providerResult.providerOrderId,
           razorpayOrderId: providerResult.provider === 'razorpay' ? providerResult.providerOrderId : null,
@@ -678,11 +688,10 @@ export async function retryOrder(orderRef, req) {
           failedReason: null,
           method: null,
         },
-        { transaction: t },
-      );
+      });
     } else {
-      await Payment.create(
-        {
+      await tx.payment.create({
+        data: {
           orderId: order.id,
           tenantId: order.tenantId,
           provider: providerResult.provider,
@@ -692,8 +701,7 @@ export async function retryOrder(orderRef, req) {
           currency: order.currency,
           status: 'CREATED',
         },
-        { transaction: t },
-      );
+      });
     }
   });
 
@@ -714,22 +722,26 @@ export async function retryOrder(orderRef, req) {
  * ------------------------------------------------------------------ */
 
 export async function getConfirmation(orderRef) {
-  const order = await Order.findOne({
+  const order = await prisma.order.findUnique({
     where: { orderRef },
-    include: [
-      { model: Customer, as: 'customer', attributes: ['id', 'name', 'email'] },
-      { model: Payment, as: 'payment', attributes: ['id', 'status', 'method', 'provider'] },
-      { model: Ticket, as: 'tickets' },
-      {
-        model: Registration,
-        as: 'registration',
-        include: [
-          { model: Event, as: 'event', attributes: ['id', 'title', 'slug', 'eventDate', 'eventTimeStart', 'venueName', 'venueAddress', 'bannerUrl'] },
-          { model: Activity, as: 'activity', attributes: ['id', 'title', 'slug', 'venue', 'startsAt'] },
-          { model: TicketType, as: 'ticketType', attributes: ['id', 'name', 'price'] },
-        ],
+    include: {
+      customer: { select: { id: true, name: true, email: true } },
+      payments: { select: { id: true, status: true, method: true, provider: true } },
+      tickets: true,
+      registration: {
+        include: {
+          event: {
+            select: { id: true, title: true, slug: true, eventDate: true, eventTimeStart: true, venueName: true, venueAddress: true, bannerUrl: true },
+          },
+          activity: {
+            select: { id: true, title: true, slug: true, venue: true, startsAt: true },
+          },
+          ticketType: {
+            select: { id: true, name: true, price: true },
+          },
+        },
       },
-    ],
+    },
   });
 
   if (!order) throw new NotFoundError('Order not found');
@@ -740,7 +752,7 @@ export async function getConfirmation(orderRef) {
     amount: Number(order.amount),
     currency: order.currency,
     customer: order.customer,
-    payment: order.payment,
+    payment: order.payments?.[0] || null,
     event: order.registration?.event,
     activity: order.registration?.activity,
     ticketType: order.registration?.ticketType,
@@ -750,21 +762,19 @@ export async function getConfirmation(orderRef) {
 }
 
 export async function getOrderPdfBuffer(orderRef) {
-  const order = await Order.findOne({
+  const order = await prisma.order.findFirst({
     where: { orderRef, status: 'PAID' },
-    include: [
-      { model: Customer, as: 'customer' },
-      { model: Ticket, as: 'tickets' },
-      {
-        model: Registration,
-        as: 'registration',
-        include: [
-          { model: Event, as: 'event' },
-          { model: Activity, as: 'activity' },
-          { model: TicketType, as: 'ticketType' },
-        ],
+    include: {
+      customer: true,
+      tickets: true,
+      registration: {
+        include: {
+          event: true,
+          activity: true,
+          ticketType: true,
+        },
       },
-    ],
+    },
   });
 
   if (!order) throw new NotFoundError('Confirmed booking not found');

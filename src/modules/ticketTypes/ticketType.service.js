@@ -1,35 +1,77 @@
-import { TicketType, Event, Ticket } from '../../database/models/index.js';
+import prisma from '../../lib/prisma.js';
 import { NotFoundError, ConflictError, ValidationError } from '../../utils/errors.js';
 import { pick } from '../../utils/helpers.js';
 
 const FIELDS = ['name', 'description', 'price', 'currency', 'quantity', 'minPerOrder', 'maxPerOrder', 'sortOrder', 'isActive', 'activityId'];
 
 const assertEvent = async (tenantId, eventId) => {
-  const event = await Event.findOne({ where: { id: eventId, tenantId } });
+  const event = await prisma.event.findFirst({
+    where: { id: Number(eventId), tenantId: Number(tenantId) },
+  });
   if (!event) throw new NotFoundError('Event not found');
   return event;
 };
 
+const sanitizeTicketTypeData = (payload) => {
+  const data = pick(payload, FIELDS);
+  if (data.price !== undefined && data.price !== null) {
+    data.price = Number(data.price);
+  }
+  if (data.quantity !== undefined && data.quantity !== null) {
+    data.quantity = Number(data.quantity);
+  }
+  if (data.minPerOrder !== undefined && data.minPerOrder !== null) {
+    data.minPerOrder = Number(data.minPerOrder);
+  }
+  if (data.maxPerOrder !== undefined && data.maxPerOrder !== null) {
+    data.maxPerOrder = Number(data.maxPerOrder);
+  }
+  if (data.sortOrder !== undefined && data.sortOrder !== null) {
+    data.sortOrder = Number(data.sortOrder);
+  }
+  if (data.activityId !== undefined) {
+    data.activityId = data.activityId ? Number(data.activityId) : null;
+  }
+  return data;
+};
+
 export async function listTicketTypes(tenantId, eventId) {
-  await assertEvent(tenantId, eventId);
-  return TicketType.findAll({ where: { tenantId, eventId }, order: [['sortOrder', 'ASC']] });
+  const tId = Number(tenantId);
+  const eId = Number(eventId);
+  await assertEvent(tId, eId);
+  return prisma.ticketType.findMany({
+    where: { tenantId: tId, eventId: eId },
+    orderBy: { sortOrder: 'asc' },
+  });
 }
 
 export async function createTicketType(tenantId, eventId, payload) {
-  await assertEvent(tenantId, eventId);
+  const tId = Number(tenantId);
+  const eId = Number(eventId);
+  await assertEvent(tId, eId);
 
   if (payload.maxPerOrder && payload.minPerOrder && payload.maxPerOrder < payload.minPerOrder) {
     throw new ValidationError('maxPerOrder cannot be lower than minPerOrder');
   }
 
-  return TicketType.create({ ...pick(payload, FIELDS), tenantId, eventId });
+  const data = sanitizeTicketTypeData(payload);
+
+  return prisma.ticketType.create({
+    data: {
+      ...data,
+      tenantId: tId,
+      eventId: eId,
+    },
+  });
 }
 
 export async function updateTicketType(tenantId, id, payload) {
-  const ticketType = await TicketType.findOne({ where: { id, tenantId } });
+  const tId = Number(tenantId);
+  const ttId = Number(id);
+  const ticketType = await prisma.ticketType.findFirst({ where: { id: ttId, tenantId: tId } });
   if (!ticketType) throw new NotFoundError('Ticket type not found');
 
-  const changes = pick(payload, FIELDS);
+  const changes = sanitizeTicketTypeData(payload);
 
   if (changes.quantity !== undefined && changes.quantity < ticketType.soldCount) {
     throw new ConflictError(`Quantity cannot be lower than the ${ticketType.soldCount} tickets already sold`);
@@ -38,19 +80,23 @@ export async function updateTicketType(tenantId, id, payload) {
     throw new ValidationError('maxPerOrder cannot be lower than minPerOrder');
   }
 
-  await ticketType.update(changes);
-  return ticketType;
+  return prisma.ticketType.update({
+    where: { id: ticketType.id },
+    data: changes,
+  });
 }
 
 export async function deleteTicketType(tenantId, id) {
-  const ticketType = await TicketType.findOne({ where: { id, tenantId } });
+  const tId = Number(tenantId);
+  const ttId = Number(id);
+  const ticketType = await prisma.ticketType.findFirst({ where: { id: ttId, tenantId: tId } });
   if (!ticketType) throw new NotFoundError('Ticket type not found');
 
-  const issued = await Ticket.count({ where: { ticketTypeId: id, tenantId } });
+  const issued = await prisma.ticket.count({ where: { ticketTypeId: ttId, tenantId: tId } });
   if (issued > 0) throw new ConflictError('Tickets have already been issued for this type — deactivate it instead');
 
-  await ticketType.destroy();
-  return { id };
+  await prisma.ticketType.delete({ where: { id: ticketType.id } });
+  return { id: ttId };
 }
 
 export default { listTicketTypes, createTicketType, updateTicketType, deleteTicketType };

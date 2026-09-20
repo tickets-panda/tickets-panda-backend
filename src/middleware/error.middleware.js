@@ -15,16 +15,23 @@ export const errorHandler = (err, req, res, next) => {
   let message = err.message || 'Internal server error';
   let errors = err.errors || null;
 
-  // Sequelize validation errors → 400 with per-field details
-  if (err.name === 'SequelizeValidationError' || err.name === 'SequelizeUniqueConstraintError') {
-    statusCode = err.name === 'SequelizeUniqueConstraintError' ? 409 : 400;
-    message = err.name === 'SequelizeUniqueConstraintError' ? 'Duplicate value' : 'Validation failed';
-    errors = err.errors?.map((e) => ({ field: e.path, message: e.message })) || null;
-  }
-
-  if (err.name === 'SequelizeForeignKeyConstraintError') {
-    statusCode = 409;
-    message = 'Related record constraint failed';
+  // Prisma error handling
+  if (err.name === 'PrismaClientKnownRequestError') {
+    if (err.code === 'P2002') {
+      statusCode = 409;
+      message = 'A record with this value already exists';
+      const target = Array.isArray(err.meta?.target) ? err.meta.target.join(', ') : err.meta?.target;
+      errors = [{ field: target || 'field', message: 'Unique constraint violation' }];
+    } else if (err.code === 'P2003') {
+      statusCode = 409;
+      message = 'Related record constraint failed';
+    } else if (err.code === 'P2025') {
+      statusCode = 404;
+      message = 'Record not found';
+    }
+  } else if (err.name === 'PrismaClientValidationError') {
+    statusCode = 400;
+    message = 'Invalid data provided to database query';
   }
 
   if (statusCode >= 500) {
