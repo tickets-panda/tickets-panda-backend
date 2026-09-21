@@ -266,6 +266,7 @@ export async function listRegistrations(tenantId, query) {
   const where = { tenantId: Number(tenantId) };
   if (query.status) where.status = query.status;
   if (query.eventId) where.eventId = Number(query.eventId);
+  if (query.activityId) where.activityId = Number(query.activityId);
 
   if (query.search) {
     where.customer = {
@@ -289,9 +290,16 @@ export async function listRegistrations(tenantId, query) {
       orderBy: { [sortBy]: sortOrder },
       include: {
         event: { select: { id: true, title: true, slug: true } },
+        activity: { select: { id: true, title: true, slug: true } },
         customer: { select: { id: true, name: true, email: true, phone: true } },
         ticketType: { select: { id: true, name: true, price: true } },
         orders: { select: { id: true, orderRef: true, amount: true, currency: true, status: true } },
+        registrationData: {
+          select: {
+            fieldValue: true,
+            formField: { select: { id: true, fieldName: true, fieldLabel: true } },
+          },
+        },
       },
     }),
   ]);

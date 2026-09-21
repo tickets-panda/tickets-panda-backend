@@ -31,7 +31,10 @@ export const listQuerySchema = Joi.object({
   limit: Joi.number().integer().min(1).max(100),
   search: Joi.string().trim().max(150).allow(''),
   status: Joi.string().trim().max(30).allow(''),
-  eventId: Joi.number().integer(),
+  eventId: 
+Joi.number().integer(),
+  activityId:
+Joi.number().integer(),
   sortBy: Joi.string().trim().max(30),
   order: Joi.string().valid('asc', 'desc', 'ASC', 'DESC'),
 });
