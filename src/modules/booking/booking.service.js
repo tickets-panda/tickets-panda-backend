@@ -540,7 +540,7 @@ async function deliverTickets({ order, registration, customer, event, activity, 
         quantity: registration.quantity,
         amount: order.amount,
         currency: order.currency,
-        dashboardUrl: `${env.tenantUrl}/studio/bookings`,
+        dashboardUrl: `${env.tenantUrl}/organizer/bookings`,
       },
     });
   }
