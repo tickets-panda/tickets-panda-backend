@@ -250,12 +250,79 @@ export async function getAnalytics(tenantId) {
     byDay.set(day, (byDay.get(day) || 0) + 1);
   });
 
+  // ---- Extended engagement metrics (gate flow, funnel, activity mix) ----
+  const [checkins, allRegs, allOrders] = await Promise.all([
+    prisma.checkin.findMany({
+      where: { tenantId: tId },
+      select: { checkedInAt: true, eventId: true, activityId: true, event: { select: { id: true, title: true } } },
+    }),
+    prisma.registration.findMany({
+      where: { tenantId: tId },
+      select: {
+        id: true,
+        status: true,
+        quantity: true,
+        activityId: true,
+        activity: { select: { id: true, title: true } },
+      },
+    }),
+    prisma.order.findMany({ where: { tenantId: tId }, select: { status: true } }),
+  ]);
+
+  const checkinsByDay = new Map();
+  const admissionsByHour = Array.from({ length: 24 }, (_, h) => ({ hour: h, count: 0 }));
+  checkins.forEach((c) => {
+    const d = new Date(c.checkedInAt);
+    const day = d.toISOString().slice(0, 10);
+    checkinsByDay.set(day, (checkinsByDay.get(day) || 0) + 1);
+    admissionsByHour[d.getHours()].count += 1;
+  });
+
+  const activityMap = new Map();
+  const checkinsByActivityKey = new Map();
+  checkins.forEach((c) => {
+    if (c.activityId) checkinsByActivityKey.set(c.activityId, (checkinsByActivityKey.get(c.activityId) || 0) + 1);
+  });
+  allRegs.forEach((r) => {
+    const key = r.activityId || `event-${r.id}-general`;
+    const entry = activityMap.get(key) || {
+      id: r.activityId,
+      title: r.activity?.title || 'General Admission',
+      registrations: 0,
+      tickets: 0,
+      checkedIn: 0,
+    };
+    entry.registrations += 1;
+    entry.tickets += Number(r.quantity || 0);
+    if (r.activityId) entry.checkedIn = checkinsByActivityKey.get(r.activityId) || 0;
+    activityMap.set(key, entry);
+  });
+
+  const confirmedCount = allRegs.filter((r) => r.status === 'CONFIRMED').length;
+  const paidOrders = allOrders.filter((o) => o.status === 'PAID').length;
+  const funnel = {
+    initiated: allRegs.length,
+    confirmed: confirmedCount,
+    ticketsIssued: ticketTypeBreakdown.reduce((sum, t) => sum + Number(t.soldCount || 0), 0),
+    checkedIn: checkins.length,
+  };
+
   return {
     revenueByEvent: [...revenueMap.values()].sort((a, b) => b.revenue - a.revenue),
     ticketTypeBreakdown,
     registrationsByDay: [...byDay.entries()]
       .map(([day, count]) => ({ day, count }))
       .sort((a, b) => a.day.localeCompare(b.day)),
+    checkinsByDay: [...checkinsByDay.entries()]
+      .map(([day, count]) => ({ day, count }))
+      .sort((a, b) => a.day.localeCompare(b.day)),
+    admissionsByHour,
+    topActivities: [...activityMap.values()].sort((a, b) => b.tickets - a.tickets).slice(0, 10),
+    funnel,
+    paymentSuccessRate: allOrders.length ? Math.round((paidOrders / allOrders.length) * 100) : 0,
+    avgTicketsPerOrder: confirmedCount
+      ? Number((allRegs.filter((r) => r.status === 'CONFIRMED').reduce((s, r) => s + Number(r.quantity || 0), 0) / confirmedCount).toFixed(2))
+      : 0,
   };
 }
 
@@ -511,6 +578,81 @@ export async function listAuditLogs(tenantId, query) {
   return { rows, pagination: buildPagination(count, page, limit) };
 }
 
+/** Per-staff gate performance + recent actions for the scanner team view. */
+export async function getStaffStats(tenantId) {
+  const tId = Number(tenantId);
+  const [members, checkins, rejections, recentActions] = await Promise.all([
+    prisma.tenantMember.findMany({
+      where: { tenantId: tId },
+      include: {
+        user: { select: { id: true, name: true, email: true, lastLoginAt: true } },
+      },
+      orderBy: { createdAt: 'asc' },
+    }),
+    prisma.checkin.findMany({
+      where: { tenantId: tId },
+      select: { checkedInBy: true, checkedInAt: true, gateName: true, event: { select: { id: true, title: true } } },
+    }),
+    prisma.auditLog.findMany({
+      where: { tenantId: tId, action: 'CHECKIN_REJECTED' },
+      select: { userId: true, createdAt: true },
+    }),
+    prisma.auditLog.findMany({
+      where: { tenantId: tId, userId: { not: null } },
+      orderBy: { createdAt: 'desc' },
+      take: 25,
+      include: { user: { select: { id: true, name: true, email: true } } },
+    }),
+  ]);
+
+  const admittedByUser = new Map();
+  const lastScanByUser = new Map();
+  checkins.forEach((c) => {
+    if (!c.checkedInBy) return;
+    admittedByUser.set(c.checkedInBy, (admittedByUser.get(c.checkedInBy) || 0) + 1);
+    const at = new Date(c.checkedInAt).getTime();
+    if (!lastScanByUser.get(c.checkedInBy) || at > lastScanByUser.get(c.checkedInBy)) {
+      lastScanByUser.set(c.checkedInBy, at);
+    }
+  });
+  const rejectedByUser = new Map();
+  rejections.forEach((r) => {
+    if (!r.userId) return;
+    rejectedByUser.set(r.userId, (rejectedByUser.get(r.userId) || 0) + 1);
+  });
+
+  const staff = members.map((m) => {
+    const admitted = admittedByUser.get(m.userId) || 0;
+    const failed = rejectedByUser.get(m.userId) || 0;
+    return {
+      memberId: m.id,
+      userId: m.userId,
+      name: m.user?.name || null,
+      email: m.user?.email || null,
+      role: m.role,
+      isActive: m.isActive,
+      assignedEvents: Array.isArray(m.assignedEvents) ? m.assignedEvents : [],
+      admitted,
+      failed,
+      scans: admitted + failed,
+      lastScanAt: lastScanByUser.get(m.userId) ? new Date(lastScanByUser.get(m.userId)).toISOString() : null,
+      lastLoginAt: m.user?.lastLoginAt || null,
+    };
+  });
+
+  return {
+    staff: staff.sort((a, b) => b.scans - a.scans),
+    recentActions: recentActions.map((a) => ({
+      id: a.id,
+      action: a.action,
+      entityType: a.entityType,
+      entityId: a.entityId,
+      createdAt: a.createdAt,
+      user: a.user,
+    })),
+  };
+}
+
 export default {
   getProfile,
   updateProfile,
@@ -528,4 +670,5 @@ export default {
   getTicket,
   listCheckins,
   listAuditLogs,
+  getStaffStats,
 };

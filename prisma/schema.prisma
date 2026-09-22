@@ -274,7 +274,7 @@ model RegistrationData {
   id             Int              @id @default(autoincrement())
   registrationId Int              @map("registration_id")
   formFieldId    Int              @map("form_field_id")
-  fieldValue     String           @map("field_value") @db.Text
+    fieldValue     String           @map("field_value") @db.LongText
   createdAt      DateTime         @default(now()) @map("created_at")
   updatedAt      DateTime         @updatedAt @map("updated_at")
   formField      RegistrationForm @relation(fields: [formFieldId], references: [id], onDelete: Cascade)

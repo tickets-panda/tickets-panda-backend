@@ -72,6 +72,11 @@ export const listAuditLogs = async (req, res) => {
   return paginated(res, rows, pagination);
 };
 
+export const getStaffStats = async (req, res) => {
+  const data = await tenantService.getStaffStats(req.tenantId);
+  return success(res, data);
+};
+
 export default {
   getProfile,
   updateProfile,
@@ -89,4 +94,5 @@ export default {
   getTicket,
   listCheckins,
   listAuditLogs,
+  getStaffStats,
 };

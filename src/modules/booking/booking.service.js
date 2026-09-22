@@ -35,6 +35,12 @@ async function validateAndStoreFormData(registration, eventId, formData, tx) {
         { field: field.fieldName, message: `${field.fieldLabel} is required` },
       ]);
     }
+    // Uploaded files arrive as base64 data URLs — cap at ~2.5MB to protect the DB.
+    if (value.startsWith('data:') && value.length > 2621440) {
+      throw new ValidationError('Validation failed', [
+        { field: field.fieldName, message: `${field.fieldLabel} file is too large (max 2 MB)` },
+      ]);
+    }
     if (value) {
       rows.push({ registrationId: registration.id, formFieldId: field.id, fieldValue: value });
     }
@@ -534,7 +540,7 @@ async function deliverTickets({ order, registration, customer, event, activity, 
         quantity: registration.quantity,
         amount: order.amount,
         currency: order.currency,
-        dashboardUrl: `${env.tenantUrl}/tenant/bookings`,
+        dashboardUrl: `${env.tenantUrl}/studio/bookings`,
       },
     });
   }

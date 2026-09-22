@@ -114,6 +114,6 @@ export const emailTemplates = {
   tenant_booking: tenantBookingEmail,
 };
 
-export const defaultDashboardUrl = () => `${env.tenantUrl}/tenant/dashboard`;
+export const defaultDashboardUrl = () => `${env.tenantUrl}/studio/dashboard`;
 
 export default emailTemplates;

@@ -30,9 +30,10 @@ app.use(
 );
 
 // Capture the raw body so Razorpay webhook signatures can be verified.
+// 10mb accommodates base64 file uploads inside registration formData.
 app.use(
   express.json({
-    limit: '2mb',
+    limit: '10mb',
     verify: (req, res, buf) => {
       req.rawBody = buf;
     },

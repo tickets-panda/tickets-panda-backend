@@ -66,7 +66,7 @@ export async function registerTenant({ name, email, password, phone, websiteUrl 
     tenantId: result.tenant.id,
     refType: 'tenant',
     refId: result.tenant.id,
-    data: { name, tenantName: result.tenant.name, dashboardUrl: `${env.tenantUrl}/tenant/dashboard` },
+    data: { name, tenantName: result.tenant.name, dashboardUrl: `${env.tenantUrl}/studio/dashboard` },
   });
 
   await recordAudit({

@@ -30,6 +30,7 @@ router.get('/payments', authorize(...OPS), validate(listQuerySchema, 'query'), c
 router.get('/tickets', authorize(...OPS), validate(listQuerySchema, 'query'), catchAsync(controller.listTickets));
 router.get('/tickets/:id', authorize(...OPS), catchAsync(controller.getTicket));
 router.get('/checkins', authorize(...GATE), validate(listQuerySchema, 'query'), catchAsync(controller.listCheckins));
+router.get('/staff-stats', authorize(...MANAGERS), catchAsync(controller.getStaffStats));
 router.get('/audit-logs', authorize(...MANAGERS), validate(listQuerySchema, 'query'), catchAsync(controller.listAuditLogs));
 
 export default router;
